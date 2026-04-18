@@ -1,0 +1,23 @@
+[project]
+name = "filament-trace-tomo"
+version = "0.1.0"
+description = "Classical voxel-based filament tracing utilities for CryoET tomograms."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mrcfile>=1.5",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-image>=0.26",
+    "scipy>=1.11",
+    "starfile>=0.5.8",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

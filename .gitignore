@@ -1,0 +1,50 @@
+# macOS / editor noise
+.DS_Store
+.vscode/
+
+# Python cache / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tomogram and mask data
+*.mrc
+*.mrcs
+*.map
+*.ccp4
+
+# CryoET / RELION style outputs
+*.star
+*.mod
+*.cmm
+
+# Local experiment outputs
+*.csv
+*.png
+*.tif
+*.tiff
+
+# Keep source-controlled code and tests under filter_test if desired,
+# but ignore generated outputs there as well.
+filter_test/*.mrc
+filter_test/*.mrcs
+filter_test/*.star
+filter_test/*.csv
+filter_test/*.png
