@@ -2,6 +2,95 @@
 
 Classical, voxel-value based utilities for tracing filaments in CryoET tomograms.
 
+## Setup On A New Machine
+
+These steps assume you have `git` and Conda or Miniconda already installed.
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/UniKuX/filamentracer_tomo.git
+cd filamentracer_tomo
+```
+
+### 2. Create the Conda environment
+
+The repository includes an `environment.yml` file with the Python packages used
+by the project and the local package installed in editable mode.
+
+```bash
+conda env create -f environment.yml
+```
+
+### 3. Activate the environment
+
+```bash
+conda activate filament-trace-tomo
+```
+
+### 4. Verify the install
+
+Run the test suite:
+
+```bash
+python -m pytest
+```
+
+You can also verify that the package imports correctly:
+
+```bash
+python -c "import filament_trace_tomo; print('import ok')"
+```
+
+## Running Local Test Scripts
+
+The `filter_test/` folder contains small scripts for experimenting on local
+tomograms in VS Code or from the terminal.
+
+Examples:
+
+### Generate a cylindrical ROI mask
+
+Edit the config block in:
+
+```text
+filter_test/generate_cylindrical_roi_mask.py
+```
+
+Then run:
+
+```bash
+python filter_test/generate_cylindrical_roi_mask.py
+```
+
+### Apply ROI masking and preprocessing
+
+Edit the config block in:
+
+```text
+filter_test/apply_cylindrical_roi_and_filter.py
+```
+
+Then run:
+
+```bash
+python filter_test/apply_cylindrical_roi_and_filter.py
+```
+
+### Compare ridge filters visually
+
+```bash
+python filter_test/plot_ridge_filter.py
+```
+
+## Notes
+
+- The repository `.gitignore` excludes large tomogram and mask outputs such as
+  `.mrc` files, so you will need to copy your own tomograms onto the new
+  machine.
+- Run commands from the repository root so that relative paths and the editable
+  install behave as expected.
+
 The first implemented piece is a RELION 5 filament particle STAR writer built on
 the `starfile` package. The intended pipeline is:
 

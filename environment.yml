@@ -1,0 +1,16 @@
+name: filament-trace-tomo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.11
+  - scikit-image>=0.26
+  - mrcfile>=1.5
+  - matplotlib
+  - pip
+  - pip:
+      - starfile>=0.5.8
+      - pytest>=8.0
+      - -e .
