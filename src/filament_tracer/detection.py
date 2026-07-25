@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -12,6 +12,7 @@ from skimage.feature import match_template
 from filament_tracer.geometry import (
     data_vector_to_physical,
     orthonormal_plane_basis,
+    physical_vector_to_data,
     transport_plane_basis,
 )
 from filament_tracer.models import TracingParameters
@@ -29,6 +30,13 @@ class DetectionDiagnostic:
     predicted_rc: tuple[float, float]
     detected_rc: tuple[float, float]
     template_source: str
+    slab_slices_used: int = 1
+    slab_spacing_angstrom: float = 0.0
+    orientation_candidates: int = 1
+    selected_orientation_offset_degrees: float = 0.0
+    circularity: float = 0.0
+    combined_score: float = 0.0
+    selected_tangent_physical_zyx: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +129,91 @@ def extract_oriented_patch(
     return patch, valid, basis_u, basis_v
 
 
+def extract_averaged_oriented_slab(
+    volume: ArrayLike,
+    center_data_zyx: NDArray[np.floating],
+    tangent_physical_zyx: NDArray[np.floating],
+    voxel_size_zyx: NDArray[np.floating],
+    radius_angstrom: float,
+    sample_spacing_angstrom: float,
+    slab_slices: int,
+    slab_spacing_angstrom: float,
+    previous_basis_u_physical_zyx: NDArray[np.floating] | None = None,
+    previous_basis_v_physical_zyx: NDArray[np.floating] | None = None,
+) -> tuple[
+    NDArray[np.float32],
+    NDArray[np.bool_],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Average parallel cross-sections with symmetric distance weights."""
+
+    if slab_slices < 1 or slab_slices % 2 == 0:
+        raise ValueError("slab_slices must be a positive odd integer")
+    if slab_spacing_angstrom <= 0:
+        raise ValueError("slab spacing must be positive")
+    if slab_slices == 1:
+        return extract_oriented_patch(
+            volume,
+            center_data_zyx,
+            tangent_physical_zyx,
+            voxel_size_zyx,
+            radius_angstrom,
+            sample_spacing_angstrom,
+            previous_basis_u_physical_zyx,
+            previous_basis_v_physical_zyx,
+        )
+
+    tangent = np.asarray(tangent_physical_zyx, dtype=float)
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-12:
+        raise ValueError("tangent must be non-zero")
+    tangent /= tangent_norm
+    voxel_size = np.asarray(voxel_size_zyx, dtype=float)
+    center_physical = np.asarray(center_data_zyx, dtype=float) * voxel_size
+    half = slab_slices // 2
+    indices = np.arange(-half, half + 1, dtype=float)
+    weights = np.power(0.5, np.abs(indices))
+
+    numerator: NDArray[np.float64] | None = None
+    valid_weight: NDArray[np.float64] | None = None
+    basis_u: NDArray[np.float64] | None = None
+    basis_v: NDArray[np.float64] | None = None
+    for index, weight in zip(indices, weights, strict=True):
+        offset_center = (center_physical + tangent * index * slab_spacing_angstrom)
+        patch, valid, current_u, current_v = extract_oriented_patch(
+            volume,
+            offset_center / voxel_size,
+            tangent,
+            voxel_size,
+            radius_angstrom,
+            sample_spacing_angstrom,
+            previous_basis_u_physical_zyx=(
+                previous_basis_u_physical_zyx if basis_u is None else basis_u
+            ),
+            previous_basis_v_physical_zyx=(
+                previous_basis_v_physical_zyx if basis_v is None else basis_v
+            ),
+        )
+        if numerator is None:
+            numerator = np.zeros_like(patch, dtype=np.float64)
+            valid_weight = np.zeros_like(patch, dtype=np.float64)
+            basis_u, basis_v = current_u, current_v
+        numerator += weight * patch * valid
+        valid_weight += weight * valid
+
+    assert numerator is not None and valid_weight is not None
+    assert basis_u is not None and basis_v is not None
+    averaged = np.divide(
+        numerator,
+        valid_weight,
+        out=np.zeros_like(numerator),
+        where=valid_weight > 0,
+    )
+    valid = valid_weight >= 0.5 * float(np.sum(weights))
+    return averaged.astype(np.float32), valid, basis_u, basis_v
+
+
 def _cross_section_template(
     radius_pixels: float,
     template_kind: str,
@@ -161,14 +254,31 @@ def extract_seed_oriented_template(
         parameters.diameter_angstrom,
         3.0 * float(np.max(voxel_size)),
     )
-    patch, valid, basis_u, basis_v = extract_oriented_patch(
-        volume,
-        np.asarray(seed_data_zyx, dtype=float),
-        tangent_physical,
-        voxel_size,
-        crop_radius,
-        sample_spacing,
-    )
+    if parameters.use_slab_averaging and parameters.slab_slices > 1:
+        slab_spacing = (
+            parameters.slab_spacing_angstrom
+            if parameters.slab_spacing_angstrom is not None
+            else float(np.min(voxel_size))
+        )
+        patch, valid, basis_u, basis_v = extract_averaged_oriented_slab(
+            volume,
+            np.asarray(seed_data_zyx, dtype=float),
+            tangent_physical,
+            voxel_size,
+            crop_radius,
+            sample_spacing,
+            parameters.slab_slices,
+            slab_spacing,
+        )
+    else:
+        patch, valid, basis_u, basis_v = extract_oriented_patch(
+            volume,
+            np.asarray(seed_data_zyx, dtype=float),
+            tangent_physical,
+            voxel_size,
+            crop_radius,
+            sample_spacing,
+        )
     if float(valid.mean()) < 0.9 or np.count_nonzero(valid) < 16:
         return None
     valid_values = patch[valid]
@@ -275,7 +385,40 @@ def _template_at_detection(
     return template
 
 
-def detect_cross_section(
+def _local_circularity(
+    image: NDArray[np.floating],
+    center_rc: tuple[float, float],
+    radius_pixels: float,
+) -> float:
+    """Estimate local isotropy from intensity-weighted second moments."""
+
+    radius = max(2.0, 1.5 * radius_pixels)
+    yy, xx = np.indices(image.shape, dtype=float)
+    local = (
+        (yy - center_rc[0]) ** 2 + (xx - center_rc[1]) ** 2
+        <= radius**2
+    )
+    if np.count_nonzero(local) < 6:
+        return 0.0
+    values = np.asarray(image, dtype=float)[local]
+    weights = np.abs(values - float(np.median(values)))
+    total = float(np.sum(weights))
+    if total <= 1e-12:
+        return 0.0
+    coordinates = np.column_stack(
+        (yy[local] - center_rc[0], xx[local] - center_rc[1])
+    )
+    centroid = np.sum(coordinates * weights[:, None], axis=0) / total
+    centered = coordinates - centroid
+    covariance = (centered * weights[:, None]).T @ centered / total
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    largest = float(eigenvalues[-1])
+    if largest <= 1e-12:
+        return 0.0
+    return float(np.clip(eigenvalues[0] / largest, 0.0, 1.0))
+
+
+def _detect_cross_section_candidate(
     volume: ArrayLike,
     predicted_data_zyx: NDArray[np.floating],
     tangent_data_zyx: NDArray[np.floating],
@@ -284,7 +427,7 @@ def detect_cross_section(
     empirical_template: NDArray[np.floating] | OrientedTemplate | None = None,
     empirical_template_source: str = "seed crop",
 ) -> DetectionResult:
-    """Find the best dot or ring near a predicted cross-section center."""
+    """Score one candidate tangent with the existing train-free detector."""
 
     voxel_size = np.asarray(voxel_size_zyx, dtype=float)
     tangent_physical = data_vector_to_physical(tangent_data_zyx, voxel_size)
@@ -301,24 +444,50 @@ def detect_cross_section(
         if isinstance(empirical_template, OrientedTemplate)
         else None
     )
-    patch, valid, basis_u, basis_v = extract_oriented_patch(
-        volume,
-        np.asarray(predicted_data_zyx, dtype=float),
-        tangent_physical,
-        voxel_size,
-        patch_radius,
-        sample_spacing,
-        previous_basis_u_physical_zyx=(
-            oriented_empirical.basis_u_physical_zyx
-            if oriented_empirical is not None
-            else None
-        ),
-        previous_basis_v_physical_zyx=(
-            oriented_empirical.basis_v_physical_zyx
-            if oriented_empirical is not None
-            else None
-        ),
+    previous_u = (
+        oriented_empirical.basis_u_physical_zyx
+        if oriented_empirical is not None
+        else None
     )
+    previous_v = (
+        oriented_empirical.basis_v_physical_zyx
+        if oriented_empirical is not None
+        else None
+    )
+    slab_slices_used = (
+        parameters.slab_slices
+        if parameters.use_slab_averaging and parameters.slab_slices > 1
+        else 1
+    )
+    slab_spacing = (
+        parameters.slab_spacing_angstrom
+        if parameters.slab_spacing_angstrom is not None
+        else float(np.min(voxel_size))
+    )
+    if slab_slices_used > 1:
+        patch, valid, basis_u, basis_v = extract_averaged_oriented_slab(
+            volume,
+            np.asarray(predicted_data_zyx, dtype=float),
+            tangent_physical,
+            voxel_size,
+            patch_radius,
+            sample_spacing,
+            slab_slices_used,
+            slab_spacing,
+            previous_basis_u_physical_zyx=previous_u,
+            previous_basis_v_physical_zyx=previous_v,
+        )
+    else:
+        patch, valid, basis_u, basis_v = extract_oriented_patch(
+            volume,
+            np.asarray(predicted_data_zyx, dtype=float),
+            tangent_physical,
+            voxel_size,
+            patch_radius,
+            sample_spacing,
+            previous_basis_u_physical_zyx=previous_u,
+            previous_basis_v_physical_zyx=previous_v,
+        )
     valid_fraction = float(valid.mean())
     valid_values = patch[valid]
     if valid_fraction < 0.65 or valid_values.size < 16:
@@ -515,11 +684,21 @@ def detect_cross_section(
         np.asarray(predicted_data_zyx, dtype=float)
         + displacement_physical / voxel_size
     )
+    confidence = float(np.clip(best_score, 0.0, 1.0))
+    circularity = (
+        _local_circularity(
+            working,
+            detected_center,
+            best_radius / sample_spacing,
+        )
+        if parameters.orientation_search or parameters.circularity_weight > 0.0
+        else 0.0
+    )
 
     return DetectionResult(
         position_zyx=position_data,
         radius_angstrom=float(best_radius),
-        confidence=float(np.clip(best_score, 0.0, 1.0)),
+        confidence=confidence,
         valid_fraction=valid_fraction,
         updated_template=updated_template,
         diagnostic=DetectionDiagnostic(
@@ -531,5 +710,158 @@ def detect_cross_section(
             predicted_rc=(float(patch_center[0]), float(patch_center[1])),
             detected_rc=detected_center,
             template_source=template_source,
+            slab_slices_used=slab_slices_used,
+            slab_spacing_angstrom=(
+                slab_spacing if slab_slices_used > 1 else 0.0
+            ),
+            circularity=circularity,
+            combined_score=(
+                confidence + parameters.circularity_weight * circularity
+            ),
+            selected_tangent_physical_zyx=tuple(
+                float(value) for value in tangent_physical
+            ),
         ),
     )
+
+
+def _orientation_candidates(
+    predicted_tangent_physical_zyx: NDArray[np.floating],
+    parameters: TracingParameters,
+    oriented_template: OrientedTemplate | None,
+) -> list[tuple[NDArray[np.float64], float]]:
+    """Generate deterministic tangent candidates in a small physical cone."""
+
+    tangent = np.asarray(predicted_tangent_physical_zyx, dtype=float)
+    tangent /= float(np.linalg.norm(tangent))
+    candidates = [(tangent, 0.0)]
+    if not parameters.orientation_search:
+        return candidates
+
+    if oriented_template is not None:
+        basis_u, basis_v = transport_plane_basis(
+            tangent,
+            oriented_template.basis_u_physical_zyx,
+            oriented_template.basis_v_physical_zyx,
+        )
+    else:
+        basis_u, basis_v = orthonormal_plane_basis(tangent)
+    azimuths = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+    for step in range(1, parameters.orientation_search_steps + 1):
+        angle_degrees = (
+            parameters.orientation_search_degrees
+            * step
+            / parameters.orientation_search_steps
+        )
+        angle = np.radians(angle_degrees)
+        for azimuth in azimuths:
+            radial = np.cos(azimuth) * basis_u + np.sin(azimuth) * basis_v
+            candidate = np.cos(angle) * tangent + np.sin(angle) * radial
+            candidate /= float(np.linalg.norm(candidate))
+            candidates.append((candidate, float(angle_degrees)))
+    return candidates
+
+
+def detect_cross_section(
+    volume: ArrayLike,
+    predicted_data_zyx: NDArray[np.floating],
+    tangent_data_zyx: NDArray[np.floating],
+    voxel_size_zyx: NDArray[np.floating],
+    parameters: TracingParameters,
+    empirical_template: NDArray[np.floating] | OrientedTemplate | None = None,
+    empirical_template_source: str = "seed crop",
+) -> DetectionResult:
+    """Find a cross-section, optionally using a slab and orientation search."""
+
+    if (
+        not parameters.use_slab_averaging
+        and not parameters.orientation_search
+        and parameters.circularity_weight == 0.0
+    ):
+        return _detect_cross_section_candidate(
+            volume,
+            predicted_data_zyx,
+            tangent_data_zyx,
+            voxel_size_zyx,
+            parameters,
+            empirical_template,
+            empirical_template_source,
+        )
+
+    voxel_size = np.asarray(voxel_size_zyx, dtype=float)
+    predicted_tangent = data_vector_to_physical(
+        tangent_data_zyx,
+        voxel_size,
+    )
+    oriented_template = (
+        empirical_template
+        if isinstance(empirical_template, OrientedTemplate)
+        else None
+    )
+    candidates = _orientation_candidates(
+        predicted_tangent,
+        parameters,
+        oriented_template,
+    )
+    best_result: DetectionResult | None = None
+    best_combined = -np.inf
+    best_angle = 0.0
+    best_tangent = predicted_tangent
+    for candidate_tangent, angle_degrees in candidates:
+        candidate_data = physical_vector_to_data(
+            candidate_tangent,
+            voxel_size,
+        )
+        result = _detect_cross_section_candidate(
+            volume,
+            predicted_data_zyx,
+            candidate_data,
+            voxel_size,
+            parameters,
+            empirical_template,
+            empirical_template_source,
+        )
+        circularity = (
+            result.diagnostic.circularity
+            if result.diagnostic is not None
+            else 0.0
+        )
+        bend_penalty = 0.01 * (
+            angle_degrees / parameters.orientation_search_degrees
+        ) ** 2
+        combined = (
+            result.confidence
+            + parameters.circularity_weight * circularity
+            - bend_penalty
+        )
+        if combined > best_combined:
+            best_result = result
+            best_combined = combined
+            best_angle = angle_degrees
+            best_tangent = candidate_tangent
+
+    assert best_result is not None
+    if best_result.diagnostic is None:
+        return best_result
+    slab_enabled = (
+        parameters.use_slab_averaging and parameters.slab_slices > 1
+    )
+    slab_spacing_used = (
+        parameters.slab_spacing_angstrom
+        if parameters.slab_spacing_angstrom is not None
+        else float(np.min(voxel_size))
+    )
+    diagnostic = replace(
+        best_result.diagnostic,
+        slab_slices_used=parameters.slab_slices if slab_enabled else 1,
+        slab_spacing_angstrom=(
+            slab_spacing_used if slab_enabled else 0.0
+        ),
+        orientation_candidates=len(candidates),
+        selected_orientation_offset_degrees=best_angle,
+        combined_score=float(best_combined),
+        selected_tangent_physical_zyx=tuple(
+            float(value) for value in best_tangent
+        ),
+    )
+    return replace(best_result, diagnostic=diagnostic)

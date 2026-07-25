@@ -374,6 +374,53 @@ class FilamentTracerWidget(QWidget):
         self._polarity.addItem("Bright density", "bright")
         form.addRow("Density polarity:", self._polarity)
 
+        self._use_slab_averaging = QCheckBox(
+            "Average parallel cross-sections"
+        )
+        form.addRow("Robust slab:", self._use_slab_averaging)
+
+        self._slab_slices_detector = QComboBox()
+        for slices in (1, 3, 5, 7, 9, 11):
+            self._slab_slices_detector.addItem(str(slices), slices)
+        self._slab_slices_detector.setCurrentIndex(1)
+        form.addRow("Detector slab slices:", self._slab_slices_detector)
+
+        self._slab_spacing_detector = self._double_spin(
+            0.0,
+            1000.0,
+            0.0,
+            1,
+        )
+        self._slab_spacing_detector.setSpecialValueText("Auto")
+        self._slab_spacing_detector.setSuffix(" Å")
+        form.addRow("Detector slab spacing:", self._slab_spacing_detector)
+
+        self._orientation_search = QCheckBox(
+            "Search nearby perpendicular planes"
+        )
+        form.addRow("Robust orientation:", self._orientation_search)
+
+        self._orientation_search_degrees = self._double_spin(
+            1.0,
+            45.0,
+            15.0,
+            1,
+        )
+        self._orientation_search_degrees.setSuffix("°")
+        form.addRow(
+            "Orientation cone half-angle:",
+            self._orientation_search_degrees,
+        )
+
+        self._orientation_search_steps = QSpinBox()
+        self._orientation_search_steps.setRange(1, 3)
+        self._orientation_search_steps.setValue(1)
+        form.addRow("Orientation cone rings:", self._orientation_search_steps)
+
+        self._circularity_weight = self._double_spin(0.0, 1.0, 0.0, 2)
+        self._circularity_weight.setSingleStep(0.05)
+        form.addRow("Circularity score weight:", self._circularity_weight)
+
         self._step_size = self._double_spin(0.25, 100.0, 2.0, 2)
         self._step_size.setSuffix(" voxels")
         form.addRow("Trace step:", self._step_size)
@@ -1590,6 +1637,17 @@ class FilamentTracerWidget(QWidget):
             f"{value:.2f}" for value in record.detected_position_zyx
         )
         state = "accepted" if record.accepted else "stopped"
+        robust = ""
+        if record.detector is not None:
+            detector = record.detector
+            robust = (
+                f"\nRobust sampling: {detector.slab_slices_used} slice(s)"
+                f" · {detector.orientation_candidates} orientation(s)"
+                f" · selected offset "
+                f"{detector.selected_orientation_offset_degrees:.1f}°"
+                f"\nCircularity: {detector.circularity:.3f} · "
+                f"combined score: {detector.combined_score:.3f}"
+            )
         return (
             f"Filament {record.filament_id} · {record.direction} "
             f"step {record.step_number} · {state}\n"
@@ -1599,7 +1657,8 @@ class FilamentTracerWidget(QWidget):
             f"radius: {record.radius_angstrom:.1f} Å · "
             f"valid patch: {record.valid_fraction:.1%}\n"
             f"Template: "
-            f"{record.detector.template_source if record.detector else 'none'}\n"
+            f"{record.detector.template_source if record.detector else 'none'}"
+            f"{robust}\n"
             f"Decision: {record.reason}"
         )
 
@@ -1806,6 +1865,19 @@ class FilamentTracerWidget(QWidget):
             max_bend_degrees=self._max_bend.value(),
             polarity=self._polarity.currentData(),
             mode=self._trace_mode.currentData(),
+            use_slab_averaging=self._use_slab_averaging.isChecked(),
+            slab_slices=self._slab_slices_detector.currentData(),
+            slab_spacing_angstrom=(
+                self._slab_spacing_detector.value()
+                if self._slab_spacing_detector.value() > 0.0
+                else None
+            ),
+            orientation_search=self._orientation_search.isChecked(),
+            orientation_search_degrees=(
+                self._orientation_search_degrees.value()
+            ),
+            orientation_search_steps=self._orientation_search_steps.value(),
+            circularity_weight=self._circularity_weight.value(),
         )
 
     def _apply_parameters(self, parameters: TracingParameters) -> None:
@@ -1825,6 +1897,22 @@ class FilamentTracerWidget(QWidget):
         self._confidence.setValue(parameters.confidence_threshold)
         self._max_bend.setValue(parameters.max_bend_degrees)
         self._set_combo_data(self._trace_mode, parameters.mode)
+        self._use_slab_averaging.setChecked(parameters.use_slab_averaging)
+        self._set_combo_data(
+            self._slab_slices_detector,
+            parameters.slab_slices,
+        )
+        self._slab_spacing_detector.setValue(
+            parameters.slab_spacing_angstrom or 0.0
+        )
+        self._orientation_search.setChecked(parameters.orientation_search)
+        self._orientation_search_degrees.setValue(
+            parameters.orientation_search_degrees
+        )
+        self._orientation_search_steps.setValue(
+            parameters.orientation_search_steps
+        )
+        self._circularity_weight.setValue(parameters.circularity_weight)
 
     def _apply_preset(self) -> None:
         _, template_kind, diameter = self._preset.currentData()

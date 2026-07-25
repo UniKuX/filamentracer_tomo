@@ -38,6 +38,24 @@ def _bright_cylinder() -> np.ndarray:
     return volume
 
 
+def _synthetic_cylinder(
+    shape: tuple[int, int, int],
+    center_zyx: np.ndarray,
+    tangent_zyx: np.ndarray,
+    sigma_voxels: float = 1.8,
+) -> np.ndarray:
+    tangent = np.asarray(tangent_zyx, dtype=float)
+    tangent /= np.linalg.norm(tangent)
+    coordinates = np.indices(shape, dtype=np.float32)
+    displacement = np.moveaxis(coordinates, 0, -1) - center_zyx
+    axial = np.sum(displacement * tangent, axis=-1)
+    perpendicular = displacement - axial[..., None] * tangent
+    distance_squared = np.sum(perpendicular**2, axis=-1)
+    return np.exp(
+        -distance_squared / (2.0 * sigma_voxels**2)
+    ).astype(np.float32)
+
+
 def test_seed_matching_recovers_bundle_translation() -> None:
     points_a = np.array(
         [[10.0, 10.0, 10.0], [10.0, 20.0, 10.0], [10.0, 10.0, 20.0]]
@@ -122,6 +140,138 @@ def test_detector_finds_cross_section_center() -> None:
     assert result.diagnostic.patch.shape == result.diagnostic.response.shape
     assert result.diagnostic.template.size > 0
     assert result.diagnostic.search_mask.dtype == bool
+
+
+def test_robust_detector_disabled_preserves_fast_path() -> None:
+    volume = _bright_cylinder()
+    common = dict(
+        diameter_angstrom=50.0,
+        polarity="bright",
+        search_radius_voxels=4.0,
+    )
+    default_result = detect_cross_section(
+        volume,
+        predicted_data_zyx=np.array([16.0, 34.0, 29.0]),
+        tangent_data_zyx=np.array([1.0, 0.0, 0.08]),
+        voxel_size_zyx=np.array([10.0, 10.0, 10.0]),
+        parameters=TracingParameters(**common),
+    )
+    explicit_result = detect_cross_section(
+        volume,
+        predicted_data_zyx=np.array([16.0, 34.0, 29.0]),
+        tangent_data_zyx=np.array([1.0, 0.0, 0.08]),
+        voxel_size_zyx=np.array([10.0, 10.0, 10.0]),
+        parameters=TracingParameters(
+            **common,
+            use_slab_averaging=False,
+            orientation_search=False,
+            circularity_weight=0.0,
+        ),
+    )
+
+    np.testing.assert_array_equal(
+        explicit_result.position_zyx,
+        default_result.position_zyx,
+    )
+    assert explicit_result.confidence == default_result.confidence
+    assert explicit_result.diagnostic is not None
+    assert default_result.diagnostic is not None
+    np.testing.assert_array_equal(
+        explicit_result.diagnostic.response,
+        default_result.diagnostic.response,
+    )
+
+
+def test_slab_averaging_improves_noisy_cross_section_score() -> None:
+    rng = np.random.default_rng(821)
+    volume = _synthetic_cylinder(
+        (31, 49, 49),
+        np.array((15.0, 24.0, 24.0)),
+        np.array((1.0, 0.0, 0.0)),
+    )
+    volume += rng.normal(0.0, 0.75, volume.shape).astype(np.float32)
+    common = dict(
+        diameter_angstrom=20.0,
+        template_kind="solid",
+        polarity="bright",
+        search_radius_voxels=4.0,
+    )
+    arguments = dict(
+        volume=volume,
+        predicted_data_zyx=np.array((15.0, 25.0, 23.0)),
+        tangent_data_zyx=np.array((1.0, 0.0, 0.0)),
+        voxel_size_zyx=np.array((5.0, 5.0, 5.0)),
+    )
+
+    fast = detect_cross_section(
+        **arguments,
+        parameters=TracingParameters(**common),
+    )
+    robust = detect_cross_section(
+        **arguments,
+        parameters=TracingParameters(
+            **common,
+            use_slab_averaging=True,
+            slab_slices=5,
+            slab_spacing_angstrom=5.0,
+        ),
+    )
+
+    assert robust.confidence >= fast.confidence
+    assert robust.diagnostic is not None
+    assert robust.diagnostic.slab_slices_used == 5
+    assert robust.diagnostic.slab_spacing_angstrom == 5.0
+
+
+def test_orientation_search_recovers_tilted_cross_section() -> None:
+    angle = np.radians(15.0)
+    true_tangent = np.array((np.cos(angle), 0.0, np.sin(angle)))
+    volume = _synthetic_cylinder(
+        (49, 49, 49),
+        np.array((24.0, 24.0, 24.0)),
+        true_tangent,
+    )
+    common = dict(
+        diameter_angstrom=20.0,
+        template_kind="solid",
+        polarity="bright",
+        search_radius_voxels=4.0,
+    )
+    arguments = dict(
+        volume=volume,
+        predicted_data_zyx=np.array((25.0, 26.0, 21.0)),
+        tangent_data_zyx=np.array((1.0, 0.0, 0.0)),
+        voxel_size_zyx=np.array((5.0, 5.0, 5.0)),
+    )
+
+    fast = detect_cross_section(
+        **arguments,
+        parameters=TracingParameters(**common),
+    )
+    robust = detect_cross_section(
+        **arguments,
+        parameters=TracingParameters(
+            **common,
+            orientation_search=True,
+            orientation_search_degrees=15.0,
+            orientation_search_steps=1,
+            circularity_weight=0.1,
+        ),
+    )
+
+    assert robust.diagnostic is not None
+    assert robust.diagnostic.orientation_candidates == 9
+    assert robust.diagnostic.selected_orientation_offset_degrees == 15.0
+    true_axis_projection = np.array((24.0, 24.0, 24.0)) + (
+        np.dot(
+            np.array((25.0, 26.0, 21.0)) - np.array((24.0, 24.0, 24.0)),
+            true_tangent,
+        )
+        * true_tangent
+    )
+    assert np.linalg.norm(
+        robust.position_zyx - true_axis_projection
+    ) < np.linalg.norm(fast.position_zyx - true_axis_projection)
 
 
 def test_detector_uses_real_seed_crop() -> None:
@@ -291,7 +441,15 @@ def test_skeleton_project_round_trip(tmp_path: Path) -> None:
             normal_zyx=(1.0, 0.0, 0.0),
         ),
         seed_matches=[SeedMatch(a_index=0, b_index=0, residual_angstrom=0.0)],
-        tracing_parameters=TracingParameters(),
+        tracing_parameters=TracingParameters(
+            use_slab_averaging=True,
+            slab_slices=5,
+            slab_spacing_angstrom=6.5,
+            orientation_search=True,
+            orientation_search_degrees=12.0,
+            orientation_search_steps=2,
+            circularity_weight=0.08,
+        ),
         filaments=filaments,
     )
     output = tmp_path / "trace.ftskeleton.json"
@@ -300,3 +458,8 @@ def test_skeleton_project_round_trip(tmp_path: Path) -> None:
     restored = SkeletonProject.load(output)
 
     assert restored == project
+
+
+def test_detector_slab_requires_an_odd_slice_count() -> None:
+    with pytest.raises(ValueError, match="slab_slices must be odd"):
+        TracingParameters(slab_slices=4)

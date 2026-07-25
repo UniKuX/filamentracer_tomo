@@ -77,6 +77,20 @@ class TracingParameters(BaseModel):
     max_bend_degrees: float = Field(default=35.0, gt=0.0, le=90.0)
     polarity: Polarity = "auto"
     mode: TraceMode = "guided"
+    use_slab_averaging: bool = False
+    slab_slices: int = Field(default=3, ge=1, le=11)
+    slab_spacing_angstrom: float | None = Field(default=None, gt=0.0)
+    orientation_search: bool = False
+    orientation_search_degrees: float = Field(default=15.0, gt=0.0, le=45.0)
+    orientation_search_steps: int = Field(default=1, ge=1, le=3)
+    circularity_weight: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @field_validator("slab_slices")
+    @classmethod
+    def validate_slab_slices(cls, value: int) -> int:
+        if value % 2 == 0:
+            raise ValueError("slab_slices must be odd")
+        return value
 
 
 class SkeletonProject(BaseModel):

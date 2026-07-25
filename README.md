@@ -65,11 +65,19 @@ drops napari's 3D Points overlays, including filament seeds.
    direction. Its in-plane coordinate frame is parallel-transported between
    steps so small tangent changes cannot rotate the patch by 90 degrees.
    Ideal dot/ring templates are explicit first-step fallbacks only.
+   For noisy or strongly bending filaments, enable **Robust slab** to average
+   3–5 parallel cross-sections and/or **Robust orientation** to test a small
+   cone of nearby perpendicular planes. `Auto` slab spacing uses the smallest
+   voxel size. Orientation search is ranked primarily by template score;
+   a circularity weight around `0.05–0.10` can help when oblique sections look
+   oval. These options cost more per tracing step and are off by default.
 8. Use **Tracing diagnostics** to inspect each attempted step. The yellow cross
    is the predicted center and the cyan/red circle is the accepted/rejected
    correlation peak. Compare the perpendicular patch, selected template, and
    score map before changing detector parameters. The template source reports
-   `seed crop` for the first step and `adaptive step N` thereafter.
+   `seed crop` for the first step and `adaptive step N` thereafter. Diagnostics
+   also report the slab slice count, number of tested orientations, selected
+   angular offset, circularity, and combined selection score.
 9. Correct vertices in the `FT skeleton vertices` layer, click
    **Sync vertex edits**, and save the result as `.ftskeleton.json`.
 
