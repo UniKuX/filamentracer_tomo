@@ -2,7 +2,10 @@
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+*.log
 *.mrc
+*.rec
+*.ftskeleton.json
 __pycache__/
 build/
 dist/

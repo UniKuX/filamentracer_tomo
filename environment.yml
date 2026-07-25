@@ -1,0 +1,9 @@
+name: filament-tracer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -e .[dev]
+

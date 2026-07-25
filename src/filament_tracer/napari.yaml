@@ -1,0 +1,12 @@
+name: filament-tracer
+display_name: Filament Tracer
+schema_version: 0.2.0
+contributions:
+  commands:
+    - id: filament-tracer.make_widget
+      python_name: filament_tracer._widget:FilamentTracerWidget
+      title: Open Filament Tracer
+  widgets:
+    - command: filament-tracer.make_widget
+      display_name: Filament Tracer
+

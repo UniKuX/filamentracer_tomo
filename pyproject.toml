@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "filament-tracer"
+version = "0.1.0"
+description = "Trace cryo-ET filament skeletons and export RELION 5 coordinates"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mrcfile>=1.5,<2",
+    "napari[pyqt6]>=0.6.4,<0.7",
+    "numpy>=1.26,<3",
+    "pydantic>=2.8,<3",
+    "scikit-image>=0.24,<1",
+    "scipy>=1.13,<2",
+    "starfile>=0.5,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-cov>=6,<8",
+    "pytest-qt>=4.4,<5",
+    "ruff>=0.12,<1",
+]
+
+[project.entry-points."napari.manifest"]
+filament-tracer = "filament_tracer:napari.yaml"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/filament_tracer"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
