@@ -59,6 +59,41 @@ def orthonormal_plane_basis(
     return first, second
 
 
+def transport_plane_basis(
+    normal_physical_zyx: NDArray[np.floating],
+    previous_first_physical_zyx: NDArray[np.floating],
+    previous_second_physical_zyx: NDArray[np.floating] | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Transport an existing in-plane frame to a nearby perpendicular plane.
+
+    Projecting the prior first axis avoids the discontinuous global-reference
+    axis changes produced by :func:`orthonormal_plane_basis`.
+    """
+
+    normal = normalize(normal_physical_zyx)
+    previous_first = normalize(previous_first_physical_zyx)
+    projected = previous_first - np.dot(previous_first, normal) * normal
+    if (
+        np.linalg.norm(projected) <= 1e-8
+        and previous_second_physical_zyx is not None
+    ):
+        previous_second = normalize(previous_second_physical_zyx)
+        projected = previous_second - np.dot(previous_second, normal) * normal
+    if np.linalg.norm(projected) <= 1e-8:
+        return orthonormal_plane_basis(normal)
+
+    first = normalize(projected)
+    if np.dot(first, previous_first) < 0.0:
+        first = -first
+    second = normalize(np.cross(normal, first))
+    if previous_second_physical_zyx is not None:
+        previous_second = normalize(previous_second_physical_zyx)
+        if np.dot(second, previous_second) < 0.0:
+            first = -first
+            second = -second
+    return first, second
+
+
 def physical_angle_degrees(
     first_data_zyx: NDArray[np.floating],
     second_data_zyx: NDArray[np.floating],

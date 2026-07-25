@@ -62,7 +62,9 @@ drops napari's 3D Points overlays, including filament seeds.
    seed: plane B supplies the forward template and plane A supplies the
    backward template. After every accepted step, the template is replaced by
    the newly detected, centered 2D cross-section for that filament and
-   direction. Ideal dot/ring templates are explicit first-step fallbacks only.
+   direction. Its in-plane coordinate frame is parallel-transported between
+   steps so small tangent changes cannot rotate the patch by 90 degrees.
+   Ideal dot/ring templates are explicit first-step fallbacks only.
 8. Use **Tracing diagnostics** to inspect each attempted step. The yellow cross
    is the predicted center and the cyan/red circle is the accepted/rejected
    correlation peak. Compare the perpendicular patch, selected template, and

@@ -12,6 +12,7 @@ from skimage.feature import match_template
 from filament_tracer.geometry import (
     data_vector_to_physical,
     orthonormal_plane_basis,
+    transport_plane_basis,
 )
 from filament_tracer.models import TracingParameters
 
@@ -31,6 +32,19 @@ class DetectionDiagnostic:
 
 
 @dataclass(frozen=True)
+class OrientedTemplate:
+    """A 2D template together with its physical in-plane coordinate frame."""
+
+    pixels: NDArray[np.float32]
+    basis_u_physical_zyx: NDArray[np.float64]
+    basis_v_physical_zyx: NDArray[np.float64]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.pixels.shape
+
+
+@dataclass(frozen=True)
 class DetectionResult:
     """Best cross-section detection around a predicted center."""
 
@@ -39,7 +53,7 @@ class DetectionResult:
     confidence: float
     valid_fraction: float
     diagnostic: DetectionDiagnostic | None = None
-    updated_template: NDArray[np.float32] | None = None
+    updated_template: OrientedTemplate | None = None
 
 
 def _odd_size(value: float, minimum: int = 9) -> int:
@@ -54,6 +68,8 @@ def extract_oriented_patch(
     voxel_size_zyx: NDArray[np.floating],
     radius_angstrom: float,
     sample_spacing_angstrom: float,
+    previous_basis_u_physical_zyx: NDArray[np.floating] | None = None,
+    previous_basis_v_physical_zyx: NDArray[np.floating] | None = None,
 ) -> tuple[
     NDArray[np.float32],
     NDArray[np.bool_],
@@ -68,7 +84,14 @@ def extract_oriented_patch(
     center_data = np.asarray(center_data_zyx, dtype=float)
     voxel_size = np.asarray(voxel_size_zyx, dtype=float)
     center_physical = center_data * voxel_size
-    basis_u, basis_v = orthonormal_plane_basis(tangent_physical_zyx)
+    if previous_basis_u_physical_zyx is None:
+        basis_u, basis_v = orthonormal_plane_basis(tangent_physical_zyx)
+    else:
+        basis_u, basis_v = transport_plane_basis(
+            tangent_physical_zyx,
+            previous_basis_u_physical_zyx,
+            previous_basis_v_physical_zyx,
+        )
 
     size = _odd_size((2.0 * radius_angstrom) / sample_spacing_angstrom + 1)
     half = size // 2
@@ -122,14 +145,14 @@ def _cross_section_template(
     return template.astype(np.float32)
 
 
-def extract_seed_template(
+def extract_seed_oriented_template(
     volume: ArrayLike,
     seed_data_zyx: NDArray[np.floating],
     tangent_data_zyx: NDArray[np.floating],
     voxel_size_zyx: NDArray[np.floating],
     parameters: TracingParameters,
-) -> NDArray[np.float32] | None:
-    """Crop and normalize a real cross-section centered on a manual seed."""
+) -> OrientedTemplate | None:
+    """Crop a seed cross-section and preserve its in-plane orientation."""
 
     voxel_size = np.asarray(voxel_size_zyx, dtype=float)
     tangent_physical = data_vector_to_physical(tangent_data_zyx, voxel_size)
@@ -138,7 +161,7 @@ def extract_seed_template(
         parameters.diameter_angstrom,
         3.0 * float(np.max(voxel_size)),
     )
-    patch, valid, _, _ = extract_oriented_patch(
+    patch, valid, basis_u, basis_v = extract_oriented_patch(
         volume,
         np.asarray(seed_data_zyx, dtype=float),
         tangent_physical,
@@ -157,7 +180,30 @@ def extract_seed_template(
     if deviation <= 1e-8:
         return None
     template /= deviation
-    return template.astype(np.float32, copy=False)
+    return OrientedTemplate(
+        pixels=template.astype(np.float32, copy=False),
+        basis_u_physical_zyx=basis_u,
+        basis_v_physical_zyx=basis_v,
+    )
+
+
+def extract_seed_template(
+    volume: ArrayLike,
+    seed_data_zyx: NDArray[np.floating],
+    tangent_data_zyx: NDArray[np.floating],
+    voxel_size_zyx: NDArray[np.floating],
+    parameters: TracingParameters,
+) -> NDArray[np.float32] | None:
+    """Crop and normalize a real cross-section centered on a manual seed."""
+
+    oriented = extract_seed_oriented_template(
+        volume,
+        seed_data_zyx,
+        tangent_data_zyx,
+        voxel_size_zyx,
+        parameters,
+    )
+    return oriented.pixels if oriented is not None else None
 
 
 def _subpixel_peak(
@@ -235,7 +281,7 @@ def detect_cross_section(
     tangent_data_zyx: NDArray[np.floating],
     voxel_size_zyx: NDArray[np.floating],
     parameters: TracingParameters,
-    empirical_template: NDArray[np.floating] | None = None,
+    empirical_template: NDArray[np.floating] | OrientedTemplate | None = None,
     empirical_template_source: str = "seed crop",
 ) -> DetectionResult:
     """Find the best dot or ring near a predicted cross-section center."""
@@ -250,6 +296,11 @@ def detect_cross_section(
         + parameters.diameter_angstrom,
     )
 
+    oriented_empirical = (
+        empirical_template
+        if isinstance(empirical_template, OrientedTemplate)
+        else None
+    )
     patch, valid, basis_u, basis_v = extract_oriented_patch(
         volume,
         np.asarray(predicted_data_zyx, dtype=float),
@@ -257,6 +308,16 @@ def detect_cross_section(
         voxel_size,
         patch_radius,
         sample_spacing,
+        previous_basis_u_physical_zyx=(
+            oriented_empirical.basis_u_physical_zyx
+            if oriented_empirical is not None
+            else None
+        ),
+        previous_basis_v_physical_zyx=(
+            oriented_empirical.basis_v_physical_zyx
+            if oriented_empirical is not None
+            else None
+        ),
     )
     valid_fraction = float(valid.mean())
     valid_values = patch[valid]
@@ -331,10 +392,15 @@ def detect_cross_section(
     best_radius = template_radius
     using_empirical = empirical_template is not None
     if using_empirical:
+        empirical_pixels = (
+            empirical_template.pixels
+            if isinstance(empirical_template, OrientedTemplate)
+            else empirical_template
+        )
         candidate_templates = [
             (
                 template_radius,
-                np.asarray(empirical_template, dtype=np.float32),
+                np.asarray(empirical_pixels, dtype=np.float32),
             )
         ]
         template_source = empirical_template_source
@@ -422,10 +488,19 @@ def detect_cross_section(
         float(best_index[0] + row_offset),
         float(best_index[1] + column_offset),
     )
-    updated_template = _template_at_detection(
+    updated_pixels = _template_at_detection(
         working,
         detected_center,
         best_template.shape,
+    )
+    updated_template = (
+        OrientedTemplate(
+            pixels=updated_pixels,
+            basis_u_physical_zyx=basis_u,
+            basis_v_physical_zyx=basis_v,
+        )
+        if updated_pixels is not None
+        else None
     )
     displacement_v = (
         best_index[0] + row_offset - patch_center[0]

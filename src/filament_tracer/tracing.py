@@ -9,8 +9,9 @@ from numpy.typing import ArrayLike, NDArray
 
 from filament_tracer.detection import (
     DetectionDiagnostic,
+    OrientedTemplate,
     detect_cross_section,
-    extract_seed_template,
+    extract_seed_oriented_template,
 )
 from filament_tracer.geometry import data_vector_to_physical, normalize
 from filament_tracer.models import (
@@ -75,7 +76,7 @@ def build_seed_templates(
     voxel_size_zyx: tuple[float, float, float],
     parameters: TracingParameters,
     direction: str,
-) -> dict[int, NDArray[np.float32]]:
+) -> dict[int, OrientedTemplate]:
     """Generate one real, direction-specific seed crop per filament."""
 
     if direction not in {"forward", "backward"}:
@@ -83,7 +84,7 @@ def build_seed_templates(
     if parameters.template_kind != "seed_crop":
         return {}
 
-    templates: dict[int, NDArray[np.float32]] = {}
+    templates: dict[int, OrientedTemplate] = {}
     voxel_size = np.asarray(voxel_size_zyx, dtype=float)
     for filament in filaments:
         seeds = [
@@ -101,7 +102,7 @@ def build_seed_templates(
             center = plane_a_seed
             tangent = plane_a_seed - plane_b_seed
         try:
-            template = extract_seed_template(
+            template = extract_seed_oriented_template(
                 volume,
                 center,
                 tangent,
@@ -149,7 +150,11 @@ def extend_skeletons(
     direction: str,
     diagnostics: list[TraceDiagnostic] | None = None,
     max_diagnostics: int = 250,
-    seed_templates: dict[int, NDArray[np.float32]] | None = None,
+    seed_templates: dict[
+        int,
+        NDArray[np.float32] | OrientedTemplate,
+    ]
+    | None = None,
 ) -> list[FilamentSkeleton]:
     """Extend a bundle while adapting each template after accepted steps."""
 
@@ -195,7 +200,7 @@ def extend_skeletons(
 
         bundle_tangent = normalize(np.median(tangents_physical, axis=0))
         accepted_positions: list[tuple[int, NDArray[np.float64]]] = []
-        candidate_template_updates: dict[int, NDArray[np.float32]] = {}
+        candidate_template_updates: dict[int, OrientedTemplate] = {}
 
         for filament in filaments:
             if filament.filament_id not in active:

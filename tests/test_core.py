@@ -3,8 +3,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from filament_tracer.detection import detect_cross_section, extract_seed_template
-from filament_tracer.geometry import match_seed_points
+from filament_tracer.detection import (
+    detect_cross_section,
+    extract_seed_oriented_template,
+    extract_seed_template,
+)
+from filament_tracer.geometry import (
+    match_seed_points,
+    orthonormal_plane_basis,
+    transport_plane_basis,
+)
 from filament_tracer.models import (
     PlaneDefinition,
     SeedMatch,
@@ -67,6 +75,29 @@ def test_screen_relative_slab_rotation_stays_orthonormal() -> None:
     assert not np.allclose(normal, (1.0, 0.0, 0.0))
 
 
+def test_transported_plane_basis_prevents_90_degree_jump() -> None:
+    first_normal = np.array((1.0, 0.0101, 0.0099))
+    second_normal = np.array((1.0, 0.0099, 0.0101))
+    first_normal /= np.linalg.norm(first_normal)
+    second_normal /= np.linalg.norm(second_normal)
+
+    first_u, first_v = orthonormal_plane_basis(first_normal)
+    discontinuous_u, _ = orthonormal_plane_basis(second_normal)
+    transported_u, transported_v = transport_plane_basis(
+        second_normal,
+        first_u,
+        first_v,
+    )
+
+    normal_angle = np.degrees(
+        np.arccos(np.clip(np.dot(first_normal, second_normal), -1.0, 1.0))
+    )
+    assert normal_angle < 0.02
+    assert abs(np.dot(discontinuous_u, first_u)) < 0.001
+    assert np.dot(transported_u, first_u) > 0.999
+    assert np.dot(transported_v, first_v) > 0.999
+
+
 def test_detector_finds_cross_section_center() -> None:
     volume = _bright_cylinder()
     parameters = TracingParameters(
@@ -126,8 +157,14 @@ def test_detector_uses_real_seed_crop() -> None:
     assert result.diagnostic.template_source == "seed crop"
     assert result.updated_template is not None
     assert result.updated_template.shape == template.shape
-    assert np.mean(result.updated_template) == pytest.approx(0.0, abs=1e-6)
-    assert np.std(result.updated_template) == pytest.approx(1.0, abs=1e-6)
+    assert np.mean(result.updated_template.pixels) == pytest.approx(
+        0.0,
+        abs=1e-6,
+    )
+    assert np.std(result.updated_template.pixels) == pytest.approx(
+        1.0,
+        abs=1e-6,
+    )
 
     adapted = detect_cross_section(
         volume,
@@ -140,6 +177,51 @@ def test_detector_uses_real_seed_crop() -> None:
     )
     assert adapted.diagnostic is not None
     assert adapted.diagnostic.template_source == "adaptive step 1"
+
+
+def test_detector_transports_adaptive_template_frame() -> None:
+    volume = _bright_cylinder()
+    parameters = TracingParameters(
+        diameter_angstrom=50.0,
+        template_kind="seed_crop",
+        search_radius_voxels=4.0,
+    )
+    voxel_size = np.array((10.0, 10.0, 10.0))
+    first_tangent = np.array((1.0, 0.0101, 0.0099))
+    second_tangent = np.array((1.0, 0.0099, 0.0101))
+    template = extract_seed_oriented_template(
+        volume,
+        seed_data_zyx=np.array((8.0, 32.0, 31.64)),
+        tangent_data_zyx=first_tangent,
+        voxel_size_zyx=voxel_size,
+        parameters=parameters,
+    )
+
+    assert template is not None
+    result = detect_cross_section(
+        volume,
+        predicted_data_zyx=np.array((16.0, 34.0, 29.0)),
+        tangent_data_zyx=second_tangent,
+        voxel_size_zyx=voxel_size,
+        parameters=parameters,
+        empirical_template=template,
+    )
+
+    assert result.updated_template is not None
+    assert (
+        np.dot(
+            template.basis_u_physical_zyx,
+            result.updated_template.basis_u_physical_zyx,
+        )
+        > 0.999
+    )
+    assert (
+        np.dot(
+            template.basis_v_physical_zyx,
+            result.updated_template.basis_v_physical_zyx,
+        )
+        > 0.999
+    )
 
 
 def test_tracer_extends_a_seeded_filament() -> None:
