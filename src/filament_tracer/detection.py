@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -30,6 +31,7 @@ class DetectionDiagnostic:
     predicted_rc: tuple[float, float]
     detected_rc: tuple[float, float]
     template_source: str
+    detector_kind: Literal["template", "neural"] = "template"
     slab_slices_used: int = 1
     slab_spacing_angstrom: float = 0.0
     orientation_candidates: int = 1

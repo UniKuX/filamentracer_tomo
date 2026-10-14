@@ -22,6 +22,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -31,7 +32,12 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from filament_tracer.geometry import MatchResult, match_seed_points, normalize
+from filament_tracer.geometry import (
+    MatchResult,
+    match_seed_points,
+    normalize,
+    smooth_skeleton,
+)
 from filament_tracer.models import (
     FilamentSkeleton,
     PlaneDefinition,
@@ -93,7 +99,7 @@ def _trace_in_worker(
 
 
 class FilamentTracerWidget(QWidget):
-    """Two-part plugin shell with a complete Part 1 tracing workflow."""
+    """Tomogram tracing, model training, and refined particle display."""
 
     def __init__(self, napari_viewer: Viewer) -> None:
         super().__init__()
@@ -104,9 +110,12 @@ class FilamentTracerWidget(QWidget):
         self._plane_b: PlaneDefinition | None = None
         self._match_result: MatchResult | None = None
         self._project: SkeletonProject | None = None
+        self._smoothing_undo = None
         self._trace_worker = None
         self._diagnostics: list[TraceDiagnostic] = []
         self._manual_session_active = False
+        self._individual_id: int | None = None
+        self._individual_history: list[SkeletonProject | None] = []
         self._manual_commits: list[
             tuple[PlaneDefinition, np.ndarray, SkeletonProject | None]
         ] = []
@@ -116,27 +125,53 @@ class FilamentTracerWidget(QWidget):
 
         self._tabs = QTabWidget()
         self._tabs.setObjectName("workflow_tabs")
-        self._tabs.addTab(self._build_trace_tab(), "1. Trace skeleton")
-        self._tabs.addTab(self._build_export_placeholder(), "2. RELION export")
+        self._tabs.setUsesScrollButtons(True)
+        self._tabs.addTab(
+            self._build_scroll_tab(
+                self._build_volume_group(), self._build_seed_group()
+            ),
+            "1. Tomogram & seeds",
+        )
+        self._tabs.addTab(
+            self._build_scroll_tab(self._build_manual_group()),
+            "2. Manual tracing",
+        )
+        self._tabs.addTab(
+            self._build_scroll_tab(
+                self._build_tracing_group(), self._build_diagnostics_group()
+            ),
+            "3. Assisted tracing",
+        )
+        self._tabs.addTab(self._build_training_tab(), "4. Model training")
+        from filament_tracer._particle_widget import ParticleDisplayWidget
+
+        self._particle_display = ParticleDisplayWidget(self)
+        self._tabs.addTab(
+            self._build_scroll_tab(self._particle_display), "5. Particle STAR display"
+        )
+
+        self._skeleton_controls = self._build_skeleton_group()
+        self._skeleton_controls.setVisible(False)
+        self._tabs.currentChanged.connect(
+            lambda index: self._skeleton_controls.setVisible(index in (1, 2))
+        )
 
         layout = QVBoxLayout()
         layout.addWidget(self._tabs)
+        layout.addWidget(self._skeleton_controls)
         self.setLayout(layout)
 
     # ------------------------------------------------------------------
     # UI construction
 
-    def _build_trace_tab(self) -> QWidget:
+    @staticmethod
+    def _build_scroll_tab(*groups: QWidget) -> QWidget:
         page = QWidget()
         content = QWidget()
         content_layout = QVBoxLayout()
 
-        content_layout.addWidget(self._build_volume_group())
-        content_layout.addWidget(self._build_seed_group())
-        content_layout.addWidget(self._build_manual_group())
-        content_layout.addWidget(self._build_tracing_group())
-        content_layout.addWidget(self._build_diagnostics_group())
-        content_layout.addWidget(self._build_skeleton_group())
+        for group in groups:
+            content_layout.addWidget(group)
         content_layout.addStretch()
         content.setLayout(content_layout)
 
@@ -226,9 +261,7 @@ class FilamentTracerWidget(QWidget):
         self._slab_projection.addItem("Average", "average")
         self._slab_projection.addItem("Maximum", "mip")
         self._slab_projection.addItem("Minimum", "minip")
-        self._slab_projection.currentIndexChanged.connect(
-            self._apply_slab_settings
-        )
+        self._slab_projection.currentIndexChanged.connect(self._apply_slab_settings)
         slab_row.addWidget(self._slab_thickness)
         slab_row.addWidget(self._slab_projection)
         slab_form.addRow("Slab:", slab_row)
@@ -279,7 +312,42 @@ class FilamentTracerWidget(QWidget):
         return group
 
     def _build_manual_group(self) -> QGroupBox:
+        outer = QGroupBox("Manual tracing")
+        outer_layout = QVBoxLayout(outer)
+        self._manual_workflow = QComboBox()
+        self._manual_workflow.addItems(
+            ["Individual filament", "Multi-filament plane matching"]
+        )
+        outer_layout.addWidget(self._manual_workflow)
+        self._individual_panel = QWidget()
+        individual_layout = QVBoxLayout(self._individual_panel)
+        help_label = QLabel(
+            "New filament → left-click its cross-section → move the plane → "
+            "click again → Finish filament. Each click is recorded immediately. "
+            "Existing filaments are kept; no automatic matching is used. "
+            "Use Save skeleton to save all filaments to disk."
+        )
+        help_label.setWordWrap(True)
+        individual_layout.addWidget(help_label)
+        row = QHBoxLayout()
+        new_button = QPushButton("New filament")
+        new_button.clicked.connect(self._new_individual_filament)
+        self._individual_finish = QPushButton("Finish filament")
+        self._individual_finish.clicked.connect(self._finish_individual_filament)
+        self._individual_undo = QPushButton("Undo last point")
+        self._individual_undo.clicked.connect(self._undo_individual_point)
+        for button in (new_button, self._individual_finish, self._individual_undo):
+            row.addWidget(button)
+        individual_layout.addLayout(row)
+        self._individual_status = QLabel(
+            "No active filament. Click New filament to begin."
+        )
+        self._individual_status.setWordWrap(True)
+        individual_layout.addWidget(self._individual_status)
+        outer_layout.addWidget(self._individual_panel)
         group = QGroupBox("Full manual multi-plane tracing")
+        self._multi_manual_panel = group
+        outer_layout.addWidget(group)
         layout = QVBoxLayout()
 
         instruction = QLabel(
@@ -338,10 +406,123 @@ class FilamentTracerWidget(QWidget):
         self._manual_status.setWordWrap(True)
         layout.addWidget(self._manual_status)
         group.setLayout(layout)
-        return group
+        self._multi_manual_panel.hide()
+        self._individual_finish.setEnabled(False)
+        self._individual_undo.setEnabled(False)
+        self._manual_workflow.currentIndexChanged.connect(self._change_manual_workflow)
+        return outer
+
+    def _change_manual_workflow(self, index: int) -> None:
+        self._finish_individual_filament()
+        self._finish_manual_trace()
+        self._individual_panel.setVisible(index == 0)
+        self._multi_manual_panel.setVisible(index == 1)
+
+    def _new_individual_filament(self, *_args: Any) -> None:
+        if self._require_image() is None:
+            return
+        self._sync_vertex_edits(render=False)
+        self._individual_id = 1 + max(
+            (f.filament_id for f in self._project.filaments)
+            if self._project is not None
+            else (),
+            default=0,
+        )
+        self._individual_history.clear()
+        self._seed_target.setCurrentIndex(0)
+        self._refresh_individual_status()
+
+    def _finish_individual_filament(self, *_args: Any) -> None:
+        self._individual_id = None
+        self._individual_history.clear()
+        self._refresh_individual_status()
+
+    def _refresh_individual_status(self) -> None:
+        active = self._individual_id is not None
+        self._individual_finish.setEnabled(active)
+        self._individual_undo.setEnabled(active and bool(self._individual_history))
+        count = (
+            next(
+                (
+                    len(f.points)
+                    for f in self._project.filaments
+                    if f.filament_id == self._individual_id
+                ),
+                0,
+            )
+            if self._project is not None
+            else 0
+        )
+        self._individual_status.setText(
+            f"Active filament {self._individual_id}: {count} points. "
+            "Move the plane and click its next cross-section; "
+            "Finish filament when done."
+            if active
+            else "No active filament. Existing paths are kept. "
+            "Click New filament to begin."
+        )
+
+    def _append_individual_point(self, point: np.ndarray) -> None:
+        if self._individual_id is None:
+            return
+        plane = self._current_plane_definition()
+        if plane is None:
+            return
+        self._sync_vertex_edits(render=False)
+        self._individual_history.append(
+            self._project.model_copy(deep=True) if self._project is not None else None
+        )
+        if self._project is None:
+            self._project = SkeletonProject(
+                volume=self._volume_metadata(self._image_layer),
+                plane_a=plane,
+                plane_b=plane,
+                seed_matches=[],
+                tracing_parameters=self._parameters(),
+                filaments=[],
+            )
+        filament = next(
+            (
+                f
+                for f in self._project.filaments
+                if f.filament_id == self._individual_id
+            ),
+            None,
+        )
+        if filament is None:
+            filament = FilamentSkeleton(filament_id=self._individual_id, points=[])
+            self._project.filaments.append(filament)
+        filament.points.append(
+            SkeletonPoint(
+                position_zyx=tuple(float(value) for value in point),
+                radius_angstrom=self._diameter.value() / 2,
+                confidence=1.0,
+                provenance="manual",
+            )
+        )
+        self._project.plane_b = plane
+        self._render_skeleton()
+        self._refresh_individual_status()
+
+    def _undo_individual_point(self, *_args: Any) -> None:
+        if self._individual_id is None or not self._individual_history:
+            return
+        self._project = self._individual_history.pop()
+        for name in (SKELETON_PATH_LAYER, SKELETON_POINT_LAYER):
+            self._remove_layer(name)
+        self._render_skeleton()
+        self._refresh_individual_status()
 
     def _build_tracing_group(self) -> QGroupBox:
-        group = QGroupBox("Classical bundle tracing")
+        group = QGroupBox("Assisted bundle tracing")
+        layout = QVBoxLayout()
+        self._detector = QComboBox()
+        self._detector.addItem("Template matching", "template")
+        self._detector.addItem("Neural network", "neural")
+        selector = QFormLayout()
+        selector.addRow("Detector:", self._detector)
+        layout.addLayout(selector)
+        self._template_settings = QGroupBox("Template matching settings")
         form = QFormLayout()
 
         self._preset = QComboBox()
@@ -374,9 +555,7 @@ class FilamentTracerWidget(QWidget):
         self._polarity.addItem("Bright density", "bright")
         form.addRow("Density polarity:", self._polarity)
 
-        self._use_slab_averaging = QCheckBox(
-            "Average parallel cross-sections"
-        )
+        self._use_slab_averaging = QCheckBox("Average parallel cross-sections")
         form.addRow("Robust slab:", self._use_slab_averaging)
 
         self._slab_slices_detector = QComboBox()
@@ -395,9 +574,7 @@ class FilamentTracerWidget(QWidget):
         self._slab_spacing_detector.setSuffix(" Å")
         form.addRow("Detector slab spacing:", self._slab_spacing_detector)
 
-        self._orientation_search = QCheckBox(
-            "Search nearby perpendicular planes"
-        )
+        self._orientation_search = QCheckBox("Search nearby perpendicular planes")
         form.addRow("Robust orientation:", self._orientation_search)
 
         self._orientation_search_degrees = self._double_spin(
@@ -420,6 +597,34 @@ class FilamentTracerWidget(QWidget):
         self._circularity_weight = self._double_spin(0.0, 1.0, 0.0, 2)
         self._circularity_weight.setSingleStep(0.05)
         form.addRow("Circularity score weight:", self._circularity_weight)
+
+        self._template_settings.setLayout(form)
+        layout.addWidget(self._template_settings)
+        self._neural_settings = QGroupBox("Neural detector settings")
+        neural_form = QFormLayout()
+        self._neural_model = QLineEdit()
+        self._neural_model.setReadOnly(True)
+        self._neural_model.setPlaceholderText("Select a saved model")
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._neural_model)
+        browse_model = QPushButton("Browse…")
+        browse_model.clicked.connect(self._select_neural_model)
+        model_row.addWidget(browse_model)
+        neural_form.addRow("Model:", model_row)
+        self._neural_device = QComboBox()
+        self._neural_device.addItems(["Auto", "CPU", "CUDA"])
+        neural_form.addRow("Device:", self._neural_device)
+        notice = QLabel(
+            "Neural inference is not implemented yet. Model selection does "
+            "not load or validate the file; tracing is unavailable for this detector."
+        )
+        notice.setWordWrap(True)
+        neural_form.addRow(notice)
+        self._neural_settings.setLayout(neural_form)
+        self._neural_settings.hide()
+        layout.addWidget(self._neural_settings)
+        shared = QGroupBox("Shared tracing controls")
+        form = QFormLayout()
 
         self._step_size = self._double_spin(0.25, 100.0, 2.0, 2)
         self._step_size.setSuffix(" voxels")
@@ -461,16 +666,34 @@ class FilamentTracerWidget(QWidget):
         self._trace_status = QLabel("Match seed planes before tracing.")
         self._trace_status.setWordWrap(True)
         form.addRow(self._trace_status)
-        group.setLayout(form)
+        shared.setLayout(form)
+        layout.addWidget(shared)
+        group.setLayout(layout)
+        self._detector.currentIndexChanged.connect(self._update_detector_controls)
         return group
+
+    def _select_neural_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select saved model", "", "Model files (*);;All files (*)"
+        )
+        if path:
+            self._neural_model.setText(path)
+
+    def _update_detector_controls(self) -> None:
+        neural = self._detector.currentData() == "neural"
+        self._template_settings.setVisible(not neural)
+        self._neural_settings.setVisible(neural)
+        self._trace_button.setEnabled(not neural)
+        self._show_selected_diagnostic()
 
     def _build_diagnostics_group(self) -> QGroupBox:
         group = QGroupBox("Tracing diagnostics")
         layout = QVBoxLayout()
 
         explanation = QLabel(
-            "Inspect the perpendicular patch, selected template, and scored "
-            "correlation map for each attempted filament step."
+            "Inspect the input patch and response map for each attempted step. "
+            "Template detection shows its template; neural detection shows "
+            "a predicted-center overlay. Saved results retain their detector type."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -487,10 +710,11 @@ class FilamentTracerWidget(QWidget):
         self._diagnostic_template = self._diagnostic_image_label()
         self._diagnostic_response = self._diagnostic_image_label()
         grid.addWidget(QLabel("Perpendicular patch"), 0, 0)
-        grid.addWidget(QLabel("Selected template"), 0, 1)
+        self._diagnostic_detail_title = QLabel("Selected template")
+        grid.addWidget(self._diagnostic_detail_title, 0, 1)
         grid.addWidget(self._diagnostic_patch, 1, 0)
         grid.addWidget(self._diagnostic_template, 1, 1)
-        grid.addWidget(QLabel("Correlation score map"), 2, 0, 1, 2)
+        grid.addWidget(QLabel("Response map"), 2, 0, 1, 2)
         grid.addWidget(self._diagnostic_response, 3, 0, 1, 2)
         layout.addLayout(grid)
 
@@ -538,24 +762,77 @@ class FilamentTracerWidget(QWidget):
         layout.addLayout(row)
 
         self._project_status = QLabel("No skeleton project")
+        smooth_form = QFormLayout()
+        self._smoothing_scale = self._double_spin(0.0, 10000.0, 100.0, 1)
+        self._smoothing_scale.setSuffix(" Å")
+        self._smoothing_scale.setToolTip(
+            "Physical smoothing length. Larger values smooth more; "
+            "excessive smoothing can straighten real bends. Endpoints stay fixed."
+        )
+        smooth_form.addRow("Smoothing scale", self._smoothing_scale)
+        self._smoothing_id = QSpinBox()
+        self._smoothing_id.setRange(0, 1000000)
+        self._smoothing_id.setSpecialValueText("All filaments")
+        smooth_form.addRow("Filament ID", self._smoothing_id)
+        layout.addLayout(smooth_form)
+        smooth_row = QHBoxLayout()
+        smooth_button = QPushButton("Smooth skeleton")
+        smooth_button.clicked.connect(self._smooth_project)
+        undo_smooth = QPushButton("Undo smoothing")
+        undo_smooth.clicked.connect(self._undo_smoothing)
+        smooth_row.addWidget(smooth_button)
+        smooth_row.addWidget(undo_smooth)
+        layout.addLayout(smooth_row)
+        self._smoothing_status = QLabel(
+            "Finish tracing before smoothing; endpoints stay fixed."
+        )
+        self._smoothing_status.setWordWrap(True)
+        layout.addWidget(self._smoothing_status)
         self._project_status.setWordWrap(True)
         layout.addWidget(self._project_status)
         group.setLayout(layout)
         return group
 
     @staticmethod
-    def _build_export_placeholder() -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout()
-        label = QLabel(
-            "Part 2 will load a .ftskeleton.json file, resample each path at "
-            "the requested inter-box distance, and export RELION 5 STAR data."
+    def _build_training_tab() -> QWidget:
+        views = QTabWidget()
+        views.setObjectName("training_views")
+        stages = (
+            (
+                "Data",
+                "Training data preparation will use tomograms and annotated "
+                "skeletons. Dataset creation and splitting are not implemented yet.",
+                ("Prepare dataset",),
+            ),
+            (
+                "Train",
+                "Model training and saving are not implemented yet. "
+                "After a trained model is saved, Use for tracing will select it "
+                "in Assisted tracing.",
+                ("Train model", "Save model", "Use for tracing"),
+            ),
+            (
+                "Evaluate",
+                "Evaluation on held-out annotations and prediction "
+                "previews will be available when the neural backend is implemented.",
+                ("Evaluate model",),
+            ),
         )
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        layout.addStretch()
-        page.setLayout(layout)
-        return page
+        for title, description, actions in stages:
+            page = QWidget()
+            layout = QVBoxLayout()
+            label = QLabel(description)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            for action in actions:
+                button = QPushButton(action)
+                button.setEnabled(False)
+                button.setToolTip("Requires the future model training backend.")
+                layout.addWidget(button)
+            layout.addStretch()
+            page.setLayout(layout)
+            views.addTab(page, title)
+        return views
 
     @staticmethod
     def _double_spin(
@@ -644,6 +921,8 @@ class FilamentTracerWidget(QWidget):
             layer.plane.normal = (1.0, 0.0, 0.0)
         self._enable_plane_view()
 
+        self._particle_display.image_changed()
+
     def _enable_plane_view(self) -> None:
         layer = self._require_image()
         if layer is None:
@@ -711,9 +990,7 @@ class FilamentTracerWidget(QWidget):
         rotated = (
             direction * np.cos(angle)
             + np.cross(rotation_axis, direction) * np.sin(angle)
-            + rotation_axis
-            * np.dot(rotation_axis, direction)
-            * (1.0 - np.cos(angle))
+            + rotation_axis * np.dot(rotation_axis, direction) * (1.0 - np.cos(angle))
         )
         return normalize(rotated)
 
@@ -772,9 +1049,7 @@ class FilamentTracerWidget(QWidget):
             return
         plane = PlaneDefinition(
             position_zyx=tuple(float(value) for value in layer.plane.position),
-            normal_zyx=tuple(
-                float(value) for value in normalize(layer.plane.normal)
-            ),
+            normal_zyx=tuple(float(value) for value in normalize(layer.plane.normal)),
             thickness=float(layer.plane.thickness),
         )
         if label == "A":
@@ -807,9 +1082,7 @@ class FilamentTracerWidget(QWidget):
                 layer.data_to_world(pivot_data),
                 dtype=float,
             )
-            self.viewer.camera.center = tuple(
-                float(value) for value in pivot_world
-            )
+            self.viewer.camera.center = tuple(float(value) for value in pivot_world)
             start_normal_world = self._data_direction_to_world(
                 layer,
                 np.asarray(layer.plane.normal, dtype=float),
@@ -841,9 +1114,7 @@ class FilamentTracerWidget(QWidget):
                     layer,
                     normal_world,
                 )
-                self.viewer.camera.center = tuple(
-                    float(value) for value in pivot_world
-                )
+                self.viewer.camera.center = tuple(float(value) for value in pivot_world)
                 if self._lock_camera_to_slab.isChecked():
                     self.viewer.camera.set_view_direction(
                         view_direction=-normal_world,
@@ -889,9 +1160,7 @@ class FilamentTracerWidget(QWidget):
                     if self._lock_camera_to_slab.isChecked():
                         self.viewer.camera.center = tuple(
                             float(value)
-                            for value in layer.data_to_world(
-                                layer.plane.position
-                            )
+                            for value in layer.data_to_world(layer.plane.position)
                         )
                     self.viewer.layers.selection.active = layer
                     event.handled = True
@@ -906,11 +1175,18 @@ class FilamentTracerWidget(QWidget):
             and self._manual_click_mode.isChecked()
             and not self._has_any_modifier(event)
         )
+        individual_marking = (
+            self._manual_workflow.currentIndex() == 0
+            and self._individual_id is not None
+            and not self._has_any_modifier(event)
+        )
         target = self._seed_target.currentData()
         if event.button != 1:
             return
-        if not manual_marking and (
-            target not in {"A", "B"} or not self._has_control_modifier(event)
+        if (
+            not manual_marking
+            and not individual_marking
+            and (target not in {"A", "B"} or not self._has_control_modifier(event))
         ):
             return
         displayed = list(self.viewer.dims.displayed)
@@ -937,10 +1213,14 @@ class FilamentTracerWidget(QWidget):
         ):
             return
 
+        if individual_marking:
+            self._append_individual_point(np.asarray(intersection, dtype=float))
+            self.viewer.layers.selection.active = layer
+            event.handled = True
+            return
+
         seed_layer = (
-            self._manual_seed_layer()
-            if manual_marking
-            else self._seed_layer(target)
+            self._manual_seed_layer() if manual_marking else self._seed_layer(target)
         )
         seed_layer.add(np.asarray(intersection, dtype=float))
         seed_layer.refresh()
@@ -1058,13 +1338,13 @@ class FilamentTracerWidget(QWidget):
                 "Start new manual skeleton",
                 "Replace the current in-memory skeleton with a new manual "
                 "trace? Save it first if it should be kept.",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
             if response != QMessageBox.StandardButton.Yes:
                 return
 
+        self._manual_workflow.setCurrentIndex(1)
         self._project = None
         self._plane_a = None
         self._plane_b = None
@@ -1087,6 +1367,7 @@ class FilamentTracerWidget(QWidget):
         ):
             self._show_error("Create or load a skeleton before continuing it.")
             return
+        self._manual_workflow.setCurrentIndex(1)
         self._sync_vertex_edits(render=False)
         self._manual_commits.clear()
         self._manual_last_message = "Continuing the current skeleton."
@@ -1123,9 +1404,7 @@ class FilamentTracerWidget(QWidget):
             return None
         return PlaneDefinition(
             position_zyx=tuple(float(value) for value in layer.plane.position),
-            normal_zyx=tuple(
-                float(value) for value in normalize(layer.plane.normal)
-            ),
+            normal_zyx=tuple(float(value) for value in normalize(layer.plane.normal)),
             thickness=float(layer.plane.thickness),
         )
 
@@ -1150,9 +1429,7 @@ class FilamentTracerWidget(QWidget):
         if plane is None:
             return
         project_before = (
-            self._project.model_copy(deep=True)
-            if self._project is not None
-            else None
+            self._project.model_copy(deep=True) if self._project is not None else None
         )
         radius = self._diameter.value() / 2.0
 
@@ -1184,15 +1461,10 @@ class FilamentTracerWidget(QWidget):
             message = f"Started {len(filaments)} manual filament paths."
         else:
             active_filaments = [
-                filament
-                for filament in self._project.filaments
-                if filament.points
+                filament for filament in self._project.filaments if filament.points
             ]
             endpoints = np.asarray(
-                [
-                    filament.points[-1].position_zyx
-                    for filament in active_filaments
-                ],
+                [filament.points[-1].position_zyx for filament in active_filaments],
                 dtype=float,
             ).reshape((-1, 3))
             result = match_seed_points(
@@ -1223,10 +1495,7 @@ class FilamentTracerWidget(QWidget):
 
             next_id = (
                 max(
-                    (
-                        filament.filament_id
-                        for filament in self._project.filaments
-                    ),
+                    (filament.filament_id for filament in self._project.filaments),
                     default=0,
                 )
                 + 1
@@ -1289,9 +1558,7 @@ class FilamentTracerWidget(QWidget):
             self._plane_a = self._project.plane_a
             self._plane_b = self._project.plane_b
             self._render_skeleton()
-        self._manual_last_message = (
-            "Last plane restored as editable current marks."
-        )
+        self._manual_last_message = "Last plane restored as editable current marks."
         self._refresh_manual_status()
 
     def _refresh_manual_status(self) -> None:
@@ -1304,9 +1571,7 @@ class FilamentTracerWidget(QWidget):
             else 0
         )
         state = "active" if self._manual_session_active else "off"
-        suffix = (
-            f" {self._manual_last_message}" if self._manual_last_message else ""
-        )
+        suffix = f" {self._manual_last_message}" if self._manual_last_message else ""
         self._manual_status.setText(
             f"Manual mode {state}: {marked} current marks; "
             f"{len(self._manual_commits)} planes committed this session; "
@@ -1368,9 +1633,7 @@ class FilamentTracerWidget(QWidget):
         )
         self._render_skeleton()
         self._refresh_seed_status()
-        self._trace_status.setText(
-            f"Initialized {len(filaments)} filament skeletons."
-        )
+        self._trace_status.setText(f"Initialized {len(filaments)} filament skeletons.")
 
     def _render_matches(
         self,
@@ -1474,9 +1737,7 @@ class FilamentTracerWidget(QWidget):
                 **self._overlay_transform(),
             )
 
-        total_points = sum(
-            len(filament.points) for filament in self._project.filaments
-        )
+        total_points = sum(len(filament.points) for filament in self._project.filaments)
         self._project_status.setText(
             f"{len(self._project.filaments)} filaments · "
             f"{total_points} skeleton vertices"
@@ -1500,6 +1761,9 @@ class FilamentTracerWidget(QWidget):
     # Tracing and editing
 
     def _start_trace(self) -> None:
+        if self._detector.currentData() == "neural":
+            self._trace_status.setText("Neural inference is not implemented yet.")
+            return
         if self._project is None:
             self._match_and_initialize()
         if self._project is None:
@@ -1514,12 +1778,12 @@ class FilamentTracerWidget(QWidget):
             parameters.max_steps = 1
         self._project.tracing_parameters = parameters
         filaments = [
-            filament.model_copy(deep=True)
-            for filament in self._project.filaments
+            filament.model_copy(deep=True) for filament in self._project.filaments
         ]
         directions = tuple(self._direction.currentData())
 
         self._trace_button.setEnabled(False)
+        self._detector.setEnabled(False)
         self._trace_status.setText("Tracing local cross-sections…")
         worker = _trace_in_worker(
             image.data,
@@ -1531,6 +1795,7 @@ class FilamentTracerWidget(QWidget):
         worker.returned.connect(self._trace_finished)
         worker.errored.connect(self._trace_failed)
         worker.finished.connect(lambda: self._trace_button.setEnabled(True))
+        worker.finished.connect(lambda: self._detector.setEnabled(True))
         self._trace_worker = worker
         worker.start()
 
@@ -1549,13 +1814,11 @@ class FilamentTracerWidget(QWidget):
         for filament in filaments:
             if filament.backward_stop_reason:
                 stops.append(
-                    f"F{filament.filament_id} back: "
-                    f"{filament.backward_stop_reason}"
+                    f"F{filament.filament_id} back: {filament.backward_stop_reason}"
                 )
             if filament.forward_stop_reason:
                 stops.append(
-                    f"F{filament.filament_id} forward: "
-                    f"{filament.forward_stop_reason}"
+                    f"F{filament.filament_id} forward: {filament.forward_stop_reason}"
                 )
         if stops:
             self._trace_status.setText(
@@ -1585,14 +1848,17 @@ class FilamentTracerWidget(QWidget):
     def _show_selected_diagnostic(self) -> None:
         index = self._diagnostic_combo.currentData()
         if index is None or not 0 <= int(index) < len(self._diagnostics):
+            self._diagnostic_detail_title.setText(
+                "Predicted-center overlay"
+                if self._detector.currentData() == "neural"
+                else "Selected template"
+            )
             return
         record = self._diagnostics[int(index)]
         detector = record.detector
         if detector is None:
             self._clear_diagnostic_images(record.reason)
-            self._diagnostic_summary.setText(
-                self._diagnostic_text(record)
-            )
+            self._diagnostic_summary.setText(self._diagnostic_text(record))
             return
 
         patch_pixmap = self._diagnostic_pixmap(
@@ -1601,7 +1867,13 @@ class FilamentTracerWidget(QWidget):
             detected_rc=detector.detected_rc,
             accepted=record.accepted,
         )
-        template_pixmap = self._diagnostic_pixmap(detector.template)
+        neural = detector.detector_kind == "neural"
+        self._diagnostic_detail_title.setText(
+            "Predicted-center overlay" if neural else "Selected template"
+        )
+        template_pixmap = (
+            patch_pixmap if neural else self._diagnostic_pixmap(detector.template)
+        )
         scored_response = np.where(
             detector.search_mask,
             detector.response,
@@ -1630,12 +1902,8 @@ class FilamentTracerWidget(QWidget):
 
     @staticmethod
     def _diagnostic_text(record: TraceDiagnostic) -> str:
-        predicted = ", ".join(
-            f"{value:.2f}" for value in record.predicted_position_zyx
-        )
-        detected = ", ".join(
-            f"{value:.2f}" for value in record.detected_position_zyx
-        )
+        predicted = ", ".join(f"{value:.2f}" for value in record.predicted_position_zyx)
+        detected = ", ".join(f"{value:.2f}" for value in record.detected_position_zyx)
         state = "accepted" if record.accepted else "stopped"
         robust = ""
         if record.detector is not None:
@@ -1758,10 +2026,7 @@ class FilamentTracerWidget(QWidget):
             return
 
         data = np.asarray(layer.data, dtype=float)
-        by_id = {
-            filament.filament_id: filament
-            for filament in self._project.filaments
-        }
+        by_id = {filament.filament_id: filament for filament in self._project.filaments}
         for filament_id, filament in by_id.items():
             indices = np.flatnonzero(
                 np.asarray(features["filament_id"], dtype=int) == filament_id
@@ -1790,6 +2055,75 @@ class FilamentTracerWidget(QWidget):
 
     # ------------------------------------------------------------------
     # Persistence
+
+    def _smoothing_ready(self) -> bool:
+        if self._individual_id is not None or self._manual_session_active:
+            self._smoothing_status.setText(
+                "Finish filament / Finish manual mode first."
+            )
+            return False
+        if self._trace_worker is not None and self._trace_worker.is_running:
+            self._smoothing_status.setText("Wait for assisted tracing to finish.")
+            return False
+        if self._project is None:
+            self._smoothing_status.setText("Create or load a skeleton first.")
+            return False
+        self._sync_vertex_edits(render=False)
+        return True
+
+    def _smooth_project(self, *_args: Any) -> None:
+        if not self._smoothing_ready():
+            return
+        before = self._project.model_copy(deep=True)
+        target = self._smoothing_id.value()
+        changed = 0
+        for filament in self._project.filaments:
+            if target and filament.filament_id != target:
+                continue
+            if len(filament.points) < 3:
+                continue
+            points = np.array([p.position_zyx for p in filament.points])
+            smoothed = smooth_skeleton(
+                points,
+                self._project.volume.voxel_size_zyx,
+                self._smoothing_scale.value(),
+            )
+            if np.allclose(points, smoothed, rtol=0, atol=1e-10):
+                continue
+            for point, position in zip(filament.points, smoothed, strict=True):
+                point.position_zyx = tuple(float(v) for v in position)
+            changed += 1
+        if not changed:
+            self._smoothing_status.setText(
+                "No changes: check ID, scale, and that paths have at least 3 points."
+            )
+            return
+        self._smoothing_undo = (before, self._project.model_dump_json())
+        self._manual_commits.clear()
+        self._individual_history.clear()
+        self._render_skeleton()
+        self._smoothing_status.setText(
+            f"Smoothed {changed} filaments. Inspect before saving; "
+            "Undo smoothing available."
+        )
+
+    def _undo_smoothing(self, *_args: Any) -> None:
+        if not self._smoothing_ready():
+            return
+        if self._smoothing_undo is None:
+            self._smoothing_status.setText("No smoothing operation to undo.")
+            return
+        before, after = self._smoothing_undo
+        if self._project.model_dump_json() != after:
+            self._smoothing_status.setText(
+                "Cannot undo: skeleton changed since smoothing. "
+                "Later edits are preserved."
+            )
+            return
+        self._project = before
+        self._smoothing_undo = None
+        self._render_skeleton()
+        self._smoothing_status.setText("Restored the skeleton before smoothing.")
 
     def _save_project_dialog(self) -> None:
         if self._project is None:
@@ -1829,6 +2163,8 @@ class FilamentTracerWidget(QWidget):
                     "skeleton volume shape does not match the active tomogram"
                 )
         self._project = project
+        self._smoothing_undo = None
+        self._finish_individual_filament()
         self._manual_session_active = False
         self._manual_commits.clear()
         self._manual_last_message = "Loaded skeleton; choose Continue to append."
@@ -1873,9 +2209,7 @@ class FilamentTracerWidget(QWidget):
                 else None
             ),
             orientation_search=self._orientation_search.isChecked(),
-            orientation_search_degrees=(
-                self._orientation_search_degrees.value()
-            ),
+            orientation_search_degrees=(self._orientation_search_degrees.value()),
             orientation_search_steps=self._orientation_search_steps.value(),
             circularity_weight=self._circularity_weight.value(),
         )
@@ -1902,16 +2236,10 @@ class FilamentTracerWidget(QWidget):
             self._slab_slices_detector,
             parameters.slab_slices,
         )
-        self._slab_spacing_detector.setValue(
-            parameters.slab_spacing_angstrom or 0.0
-        )
+        self._slab_spacing_detector.setValue(parameters.slab_spacing_angstrom or 0.0)
         self._orientation_search.setChecked(parameters.orientation_search)
-        self._orientation_search_degrees.setValue(
-            parameters.orientation_search_degrees
-        )
-        self._orientation_search_steps.setValue(
-            parameters.orientation_search_steps
-        )
+        self._orientation_search_degrees.setValue(parameters.orientation_search_degrees)
+        self._orientation_search_steps.setValue(parameters.orientation_search_steps)
         self._circularity_weight.setValue(parameters.circularity_weight)
 
     def _apply_preset(self) -> None:

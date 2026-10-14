@@ -11,6 +11,7 @@ from filament_tracer.detection import (
 from filament_tracer.geometry import (
     match_seed_points,
     orthonormal_plane_basis,
+    smooth_skeleton,
     transport_plane_basis,
 )
 from filament_tracer.models import (
@@ -26,6 +27,27 @@ from filament_tracer.tracing import (
     extend_skeletons,
     initialize_skeletons,
 )
+
+
+def test_skeleton_smoothing_physical_coordinates_and_endpoints():
+    points = np.array([[0, 0, 0], [1, 2, 0], [4, -2, 0], [8, 0, 0]], float)
+    voxel = np.array([10, 2, 3])
+    result = smooth_skeleton(points, voxel, 20)
+    np.testing.assert_array_equal(result[[0, -1]], points[[0, -1]])
+    assert np.linalg.norm(result[:, 1]) < np.linalg.norm(points[:, 1])
+    np.testing.assert_allclose(
+        result * voxel, smooth_skeleton(points * voxel, [1, 1, 1], 20)
+    )
+    straight = np.array([[0, 0, 0], [1, 2, 3], [4, 8, 12], [10, 20, 30]])
+    np.testing.assert_allclose(smooth_skeleton(straight, voxel, 100), straight)
+    np.testing.assert_array_equal(smooth_skeleton(points, voxel, 0), points)
+    duplicated = np.repeat(points, 2, axis=0)
+    np.testing.assert_allclose(
+        smooth_skeleton(duplicated, voxel, 20), np.repeat(result, 2, axis=0)
+    )
+    np.testing.assert_array_equal(smooth_skeleton(points[:2], voxel, 20), points[:2])
+    with pytest.raises(ValueError):
+        smooth_skeleton(points, voxel, -1)
 
 
 def _bright_cylinder() -> np.ndarray:
@@ -51,15 +73,11 @@ def _synthetic_cylinder(
     axial = np.sum(displacement * tangent, axis=-1)
     perpendicular = displacement - axial[..., None] * tangent
     distance_squared = np.sum(perpendicular**2, axis=-1)
-    return np.exp(
-        -distance_squared / (2.0 * sigma_voxels**2)
-    ).astype(np.float32)
+    return np.exp(-distance_squared / (2.0 * sigma_voxels**2)).astype(np.float32)
 
 
 def test_seed_matching_recovers_bundle_translation() -> None:
-    points_a = np.array(
-        [[10.0, 10.0, 10.0], [10.0, 20.0, 10.0], [10.0, 10.0, 20.0]]
-    )
+    points_a = np.array([[10.0, 10.0, 10.0], [10.0, 20.0, 10.0], [10.0, 10.0, 20.0]])
     translation = np.array([5.0, 1.0, -2.0])
     points_b = points_a[[2, 0, 1]] + translation
 
@@ -269,9 +287,9 @@ def test_orientation_search_recovers_tilted_cross_section() -> None:
         )
         * true_tangent
     )
-    assert np.linalg.norm(
-        robust.position_zyx - true_axis_projection
-    ) < np.linalg.norm(fast.position_zyx - true_axis_projection)
+    assert np.linalg.norm(robust.position_zyx - true_axis_projection) < np.linalg.norm(
+        fast.position_zyx - true_axis_projection
+    )
 
 
 def test_detector_uses_real_seed_crop() -> None:

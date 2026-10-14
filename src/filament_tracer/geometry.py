@@ -6,7 +6,48 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.linalg import solve_banded
 from scipy.optimize import linear_sum_assignment
+
+
+def smooth_skeleton(points, voxel_size_zyx, scale_angstrom):
+    """Implicit diffusion along physical arclength, with fixed endpoints.
+
+    Preserve vertex count/order, including consecutive duplicate points.
+    The tridiagonal solve uses positive averaging weights and cannot overshoot
+    the coordinate bounds of the original path. Scale is a physical length,
+    not a number of vertices; larger values remove broader bends as well.
+    """
+    points = np.asarray(points, dtype=float)
+    voxel = np.asarray(voxel_size_zyx, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+        raise ValueError("Expected finite N x 3 skeleton coordinates")
+    if voxel.shape != (3,) or not np.isfinite(voxel).all() or np.any(voxel <= 0):
+        raise ValueError("Voxel sizes must be finite and positive")
+    if not np.isfinite(scale_angstrom) or scale_angstrom < 0:
+        raise ValueError("Smoothing scale must be finite and nonnegative")
+    if len(points) < 3 or scale_angstrom == 0:
+        return points.copy()
+    physical = points * voxel
+    keep = np.r_[True, np.linalg.norm(np.diff(physical, axis=0), axis=1) > 1e-8]
+    mapping = np.cumsum(keep) - 1
+    vertices = physical[keep]
+    if len(vertices) < 3:
+        return points.copy()
+    lengths = np.linalg.norm(np.diff(vertices, axis=0), axis=1)
+    left, right = lengths[:-1], lengths[1:]
+    lower = 2 * scale_angstrom**2 / ((left + right) * left)
+    upper = 2 * scale_angstrom**2 / ((left + right) * right)
+    band = np.zeros((3, len(vertices)))
+    band[1] = 1
+    band[1, 1:-1] += lower + upper
+    band[2, :-2] = -lower
+    band[0, 2:] = -upper
+    smoothed = solve_banded((1, 1), band, vertices)
+    smoothed[[0, -1]] = vertices[[0, -1]]
+    result = smoothed[mapping] / voxel
+    result[0], result[-1] = points[0], points[-1]
+    return result
 
 
 @dataclass(frozen=True)
@@ -73,10 +114,7 @@ def transport_plane_basis(
     normal = normalize(normal_physical_zyx)
     previous_first = normalize(previous_first_physical_zyx)
     projected = previous_first - np.dot(previous_first, normal) * normal
-    if (
-        np.linalg.norm(projected) <= 1e-8
-        and previous_second_physical_zyx is not None
-    ):
+    if np.linalg.norm(projected) <= 1e-8 and previous_second_physical_zyx is not None:
         previous_second = normalize(previous_second_physical_zyx)
         projected = previous_second - np.dot(previous_second, normal) * normal
     if np.linalg.norm(projected) <= 1e-8:
@@ -146,9 +184,7 @@ def match_seed_points(
         axis=2,
     )
     row_indices, column_indices = linear_sum_assignment(provisional_cost)
-    pair_displacements = (
-        physical_b[column_indices] - physical_a[row_indices]
-    )
+    pair_displacements = physical_b[column_indices] - physical_a[row_indices]
     displacement = np.median(pair_displacements, axis=0)
 
     cost = np.linalg.norm(

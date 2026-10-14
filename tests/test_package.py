@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,16 +18,47 @@ def test_version() -> None:
     assert __version__ == "0.1.0"
 
 
-def test_two_part_widget(make_napari_viewer) -> None:
+def test_workflow_widget(make_napari_viewer) -> None:
     from filament_tracer._widget import FilamentTracerWidget
 
     viewer = make_napari_viewer()
     widget = FilamentTracerWidget(viewer)
 
     tabs = widget.findChild(QTabWidget, "workflow_tabs")
-    assert tabs.count() == 2
-    assert tabs.tabText(0) == "1. Trace skeleton"
-    assert tabs.tabText(1) == "2. RELION export"
+    assert tabs.count() == 5
+    assert [tabs.tabText(index) for index in range(5)] == [
+        "1. Tomogram & seeds",
+        "2. Manual tracing",
+        "3. Assisted tracing",
+        "4. Model training",
+        "5. Particle STAR display",
+    ]
+    assert tabs.widget(0).isAncestorOf(widget._volume_label)
+    assert tabs.widget(0).isAncestorOf(widget._seed_target)
+    assert tabs.widget(1).isAncestorOf(widget._manual_click_mode)
+    assert tabs.widget(2).isAncestorOf(widget._trace_button)
+    assert tabs.widget(2).isAncestorOf(widget._diagnostic_combo)
+    for index in range(5):
+        tabs.setCurrentIndex(index)
+        assert widget._skeleton_controls.isHidden() == (index not in (1, 2))
+    tabs.setCurrentIndex(0)
+
+    training = widget.findChild(QTabWidget, "training_views")
+    assert [training.tabText(i) for i in range(3)] == [
+        "Data",
+        "Train",
+        "Evaluate",
+    ]
+    widget._detector.setCurrentIndex(1)
+    assert widget._template_settings.isHidden()
+    assert not widget._neural_settings.isHidden()
+    assert not widget._trace_button.isEnabled()
+    widget._start_trace()
+    assert widget._trace_worker is None
+    widget._detector.setCurrentIndex(0)
+    assert not widget._template_settings.isHidden()
+    assert widget._neural_settings.isHidden()
+    assert widget._trace_button.isEnabled()
 
     detector = DetectionDiagnostic(
         patch=np.arange(81, dtype=np.float32).reshape(9, 9),
@@ -59,6 +91,11 @@ def test_two_part_widget(make_napari_viewer) -> None:
     assert widget._diagnostic_patch.pixmap() is not None
     assert not widget._diagnostic_patch.pixmap().isNull()
     assert "Confidence: 0.420" in widget._diagnostic_summary.text()
+    widget._detector.setCurrentIndex(1)
+    assert widget._diagnostic_detail_title.text() == "Selected template"
+    widget._diagnostics[0].detector = replace(detector, detector_kind="neural")
+    widget._show_selected_diagnostic()
+    assert widget._diagnostic_detail_title.text() == "Predicted-center overlay"
 
 
 def test_widget_initializes_skeleton_from_seed_layers(make_napari_viewer) -> None:
@@ -79,12 +116,8 @@ def test_widget_initializes_skeleton_from_seed_layers(make_napari_viewer) -> Non
         position_zyx=(8.0, 16.0, 16.0),
         normal_zyx=(1.0, 0.0, 0.0),
     )
-    widget._seed_layer("A").data = np.array(
-        [[5.0, 12.0, 12.0], [5.0, 20.0, 20.0]]
-    )
-    widget._seed_layer("B").data = np.array(
-        [[8.0, 12.0, 12.0], [8.0, 20.0, 20.0]]
-    )
+    widget._seed_layer("A").data = np.array([[5.0, 12.0, 12.0], [5.0, 20.0, 20.0]])
+    widget._seed_layer("B").data = np.array([[8.0, 12.0, 12.0], [8.0, 20.0, 20.0]])
 
     widget._match_and_initialize()
 
@@ -336,6 +369,100 @@ def test_shift_left_translates_plane_without_marking_manual_point(
     )
     mouse_press_callbacks(viewer, control_event)
     assert len(viewer.layers[MANUAL_SEED_LAYER].data) == 1
+
+
+def test_individual_filaments_click_finish_new_and_undo(make_napari_viewer, tmp_path):
+    from filament_tracer._widget import FilamentTracerWidget
+
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((24, 32, 32), dtype=np.float32))
+    widget = FilamentTracerWidget(viewer)
+    widget._set_image_layer(image)
+    image.plane.normal = (1.0, 0.0, 0.0)
+
+    def click(z):
+        image.plane.position = (z, 16.0, 16.0)
+        event = SimpleNamespace(
+            type="mouse_press",
+            button=1,
+            modifiers=(),
+            position=image.data_to_world((z, 12.0, 12.0)),
+            view_direction=np.array((1.0, 0.0, 0.0)),
+            handled=False,
+        )
+        mouse_press_callbacks(viewer, event)
+        return event.handled
+
+    assert widget._manual_workflow.currentIndex() == 0
+    widget._new_individual_filament()
+    assert click(4)
+    widget._undo_individual_point()
+    assert widget._project is None
+    assert click(4)
+    assert click(8)
+    widget._finish_individual_filament()
+    assert not click(10)
+    assert len(widget._project.filaments[0].points) == 2
+
+    widget._new_individual_filament()
+    assert click(8)  # Same location must create a separate ID, not reconnect.
+    assert click(12)
+    assert [f.filament_id for f in widget._project.filaments] == [1, 2]
+    widget._undo_individual_point()
+    assert [len(f.points) for f in widget._project.filaments] == [2, 1]
+    widget._finish_individual_filament()
+    widget._undo_individual_point()
+    assert [len(f.points) for f in widget._project.filaments] == [2, 1]
+    widget._new_individual_filament()
+    widget._manual_workflow.setCurrentIndex(1)
+    assert widget._individual_id is None
+    assert not click(16)
+    saved = tmp_path / "individual.ftskeleton.json"
+    widget._project.save(saved)
+    widget._manual_workflow.setCurrentIndex(0)
+    widget.load_project(saved)
+    assert widget._individual_id is None
+    widget._new_individual_filament()
+    assert click(16)
+    assert [f.filament_id for f in widget._project.filaments] == [1, 2, 3]
+    assert [len(f.points) for f in widget._project.filaments] == [2, 1, 1]
+
+
+def test_smoothing_selection_undo_and_edit_protection(make_napari_viewer):
+    from filament_tracer._widget import SKELETON_POINT_LAYER, FilamentTracerWidget
+
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((24, 32, 32), dtype=np.float32))
+    widget = FilamentTracerWidget(viewer)
+    widget._set_image_layer(image)
+    for y in (10, 20):
+        widget._new_individual_filament()
+        for p in ((2, y, 10), (8, y + 3, 10), (16, y, 10)):
+            widget._append_individual_point(np.array(p))
+        widget._finish_individual_filament()
+    original = widget._project.model_dump_json()
+    widget._smoothing_id.setValue(1)
+    widget._smoothing_scale.setValue(10)
+    widget._smooth_project()
+    assert widget._project.filaments[0].points[1].position_zyx[1] < 13
+    assert widget._project.filaments[1].points[1].position_zyx[1] == 23
+    widget._undo_smoothing()
+    assert widget._project.model_dump_json() == original
+    widget._smoothing_id.setValue(0)
+    widget._smooth_project()
+    assert widget._project.filaments[1].points[1].position_zyx[1] < 23
+    layer = viewer.layers[SKELETON_POINT_LAYER]
+    data = layer.data.copy()
+    data[1, 1] += 1
+    layer.data = data
+    widget._undo_smoothing()
+    assert "Cannot undo" in widget._smoothing_status.text()
+    assert widget._project.filaments[0].points[1].position_zyx[1] == data[1, 1]
+    widget._new_individual_filament()
+    before = widget._project.model_dump_json()
+    widget._smooth_project()
+    assert widget._project.model_dump_json() == before
+    assert "Finish" in widget._smoothing_status.text()
 
 
 def test_manual_mode_connects_unordered_marks_across_planes(

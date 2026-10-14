@@ -11,3 +11,5 @@ build/
 dist/
 htmlcov/
 .coverage
+*.npz
+*.star

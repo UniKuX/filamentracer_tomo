@@ -7,6 +7,9 @@ A napari plugin for cryo-ET filament workflows, separated into:
 
 ## WSL development environment
 
+For standalone, reviewed perpendicular training crops from manually picked
+microtubules, see [training data preparation](docs/training_data.md).
+
 The supported development environment is Ubuntu 24.04 under WSL2. Miniconda is
 installed in `/home/weilong/miniconda3`, and the project environment is named
 `filament-tracer`.
@@ -34,6 +37,27 @@ rendering because the current WSLg Zink path displays image planes but silently
 drops napari's 3D Points overlays, including filament seeds.
 
 ## Part 1 workflow
+
+The plugin has five tabs:
+
+- **1. Tomogram & seeds**: tomogram display, slab settings, parallel planes,
+  and bundle seed selection/matching.
+- **2. Manual tracing**: full manual multi-plane tracing.
+- **3. Assisted tracing**: detector selection (Template matching / Neural
+  network), detector-specific settings, shared tracing controls, and diagnostics.
+  Template matching is available; neural model/device selection is a UI preview
+  and neural inference is not implemented yet.
+- **4. Model training**: Data, Train, and Evaluate views for the future training
+  workflow. Training, model saving, evaluation, and Use for tracing are disabled
+  until the neural backend is implemented.
+- **5. Particle STAR display**: load refined RELION particles, select a tomogram
+  and class, and overlay positions with optional refinement origin shifts.
+  See [particle display](docs/particle_display.md).
+
+RELION export is a standalone CLI; see [RELION export](docs/relion_export.md).
+
+Skeleton load/save and vertex synchronization controls appear beneath the
+manual and assisted tracing tabs and operate on the same skeleton project.
 
 1. Launch the plugin with `scripts/launch_wsl.sh`.
 2. Use **Open MRC/REC** to memory-map a tomogram, or select an existing 3D
@@ -83,8 +107,34 @@ drops napari's 3D Points overlays, including filament seeds.
 
 ### Full manual tracing
 
-Use **Full manual multi-plane tracing** when every skeleton point should be
-placed manually:
+The shared **Editable skeleton project** controls offer **Smooth skeleton**.
+Finish manual/assisted tracing first, select a filament ID (0 means all), and
+set the smoothing scale in ångströms (default 100 Å = 10 nm). Larger scales smooth
+more strongly. The operation uses physical arclength, including anisotropic
+voxel spacing, and keeps endpoints, vertex counts, IDs and point metadata intact.
+Paths with fewer than three points are unchanged. Inspect the result: excessive
+smoothing can flatten genuine bends. **Undo smoothing** restores the most recent
+smoothing operation only if no subsequent skeleton edits have occurred. Save the
+skeleton to use its smoothed coordinates in training-data preparation. Applying
+smoothing repeatedly is cumulative; undo before comparing different scales.
+
+Tab **2. Manual tracing** defaults to **Individual filament**:
+
+1. Click **New filament** to start a separate path without replacing existing ones.
+2. Left-click its cross-section. Each click immediately records a skeleton point.
+3. Move the slab (Shift+left-drag) or rotate it, and click the next cross-section.
+4. Use **Undo last point** to remove a mistaken click on the active filament.
+5. Click **Finish filament** to stop adding points. Click **New filament** for the
+   next microtubule; it receives a separate ID even if it is near an existing path.
+6. Use **Save skeleton** to save all paths to disk. Finishing does not save a file.
+
+No plane commit or endpoint matching is used in this mode. Switching modes ends
+the active individual filament; it keeps its recorded points. A loaded skeleton
+has no active filament, and **New filament** appends a new path to it.
+
+Select **Multi-filament plane matching** for the original workflow below. This
+mode matches against existing endpoints, including previously drawn paths, so
+stay in Individual filament mode when paths must remain explicitly separate:
 
 1. Click **Start new manual skeleton**. Manual marking becomes active and plain
    unmodified left-clicks add yellow points on the current slab.
@@ -106,4 +156,5 @@ matching. Increase it when the slab spacing or filament curvature produces a
 larger inter-plane displacement residual.
 
 The tracing output is a collection of ordered, non-branching polylines. The
-saved skeleton is the formal input to the later RELION export module.
+saved skeleton is the input to `scripts/export_relion.py` for RELION coordinate
+STAR export at a user-specified inter-box distance.
