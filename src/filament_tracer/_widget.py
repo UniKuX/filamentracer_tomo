@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import mrcfile
@@ -10,7 +11,7 @@ import numpy as np
 from napari import Viewer
 from napari.layers import Image, Points, Shapes, Vectors
 from napari.qt.threading import thread_worker
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QObject, Qt, Signal
 from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -60,6 +61,15 @@ MATCH_LAYER = "FT seed matches"
 SKELETON_PATH_LAYER = "FT skeleton paths"
 SKELETON_POINT_LAYER = "FT skeleton vertices"
 MANUAL_SEED_LAYER = "FT manual current plane"
+PIVOT_LAYER = "FT slab rotation pivot"
+DIAGNOSTIC_PATH_LAYER = "FT diagnostic filament"
+DIAGNOSTIC_POINT_LAYER = "FT diagnostic step"
+LIVE_TRACE_LAYER = "FT live accepted points"
+LIVE_PREDICTION_LAYER = "FT live prediction"
+
+
+class _TraceProgressSignals(QObject):
+    updated = Signal(object)
 
 
 @thread_worker
@@ -69,10 +79,30 @@ def _trace_in_worker(
     voxel_size_zyx: tuple[float, float, float],
     parameters: TracingParameters,
     directions: tuple[str, ...],
+    progress: Any = None,
 ) -> tuple[list, list[TraceDiagnostic]]:
     """Extend copied skeleton models without touching Qt or napari state."""
 
     diagnostics: list[TraceDiagnostic] = []
+    last_prediction = last_step = float("-inf")
+
+    def predicted(filament_id: int, step: int, position: tuple) -> None:
+        nonlocal last_prediction
+        now = monotonic()
+        if progress is not None and now - last_prediction >= 0.1:
+            last_prediction = now
+            progress.emit(("prediction", position, filament_id, direction, step))
+
+    def completed(current: list, step: int) -> None:
+        nonlocal last_step
+        now = monotonic()
+        if progress is not None and now - last_step >= 0.1:
+            last_step = now
+            # Copy values before crossing threads; worker models keep changing.
+            positions = [p.position_zyx for f in current for p in f.points]
+            ids = [f.filament_id for f in current for _p in f.points]
+            progress.emit(("accepted", positions, ids, direction, step))
+
     for direction in directions:
         seed_templates = build_seed_templates(
             volume,
@@ -94,6 +124,8 @@ def _trace_in_worker(
             direction,
             diagnostics=diagnostics,
             seed_templates=seed_templates,
+            on_prediction=predicted if progress is not None else None,
+            on_step=completed if progress is not None else None,
         )
     return filaments, diagnostics
 
@@ -112,6 +144,8 @@ class FilamentTracerWidget(QWidget):
         self._project: SkeletonProject | None = None
         self._smoothing_undo = None
         self._trace_worker = None
+        self._trace_progress_signals = _TraceProgressSignals(self)
+        self._trace_progress_signals.updated.connect(self._show_trace_progress)
         self._diagnostics: list[TraceDiagnostic] = []
         self._manual_session_active = False
         self._individual_id: int | None = None
@@ -224,7 +258,9 @@ class FilamentTracerWidget(QWidget):
         instruction = QLabel(
             "Orient the napari image plane, capture A, then Ctrl+click each "
             "filament cross-section. Move the plane, capture B, and mark the "
-            "same bundle again. Right-drag rotates the slab around its center. "
+            "same bundle again. Right-drag rotates around the crosshair. "
+            "Middle-drag pans without tilting. Ctrl+right-click sets the pivot on the "
+            "central plane. Use selected point sets its exact 3D position. "
             "Shift+left-drag translates it along its normal."
         )
         instruction.setWordWrap(True)
@@ -274,6 +310,15 @@ class FilamentTracerWidget(QWidget):
         rotation_row.addWidget(self._rotation_sensitivity)
         rotation_row.addWidget(self._lock_camera_to_slab)
         slab_form.addRow("Right-drag rotation:", rotation_row)
+
+        pivot_row = QHBoxLayout()
+        selected_pivot = QPushButton("Use selected point as pivot")
+        selected_pivot.clicked.connect(self._use_selected_pivot)
+        reset_pivot = QPushButton("Reset pivot to slice centre")
+        reset_pivot.clicked.connect(self._reset_slab_pivot)
+        pivot_row.addWidget(selected_pivot)
+        pivot_row.addWidget(reset_pivot)
+        slab_form.addRow(pivot_row)
 
         face_camera = QPushButton("Face slab toward camera")
         face_camera.clicked.connect(self._face_plane_to_camera)
@@ -691,7 +736,10 @@ class FilamentTracerWidget(QWidget):
         layout = QVBoxLayout()
 
         explanation = QLabel(
-            "Inspect the input patch and response map for each attempted step. "
+            "Steps are grouped by filament, then direction. The selected filament "
+            "and predicted step are highlighted and labelled in the viewer. "
+            "The patch shows the detector's single slice or averaged slab, "
+            "using the settings saved for that step (not the viewing slab). "
             "Template detection shows its template; neural detection shows "
             "a predicted-center overlay. Saved results retain their detector type."
         )
@@ -705,11 +753,25 @@ class FilamentTracerWidget(QWidget):
         )
         layout.addWidget(self._diagnostic_combo)
 
+        navigation = QHBoxLayout()
+        previous = QPushButton("Previous step")
+        previous.clicked.connect(lambda: self._advance_diagnostic(-1))
+        following = QPushButton("Next step")
+        following.clicked.connect(lambda: self._advance_diagnostic(1))
+        centre = QPushButton("Centre on step")
+        centre.clicked.connect(self._centre_diagnostic)
+        navigation.addWidget(previous)
+        navigation.addWidget(following)
+        navigation.addWidget(centre)
+        layout.addLayout(navigation)
+
         grid = QGridLayout()
         self._diagnostic_patch = self._diagnostic_image_label()
         self._diagnostic_template = self._diagnostic_image_label()
         self._diagnostic_response = self._diagnostic_image_label()
-        grid.addWidget(QLabel("Perpendicular patch"), 0, 0)
+        self._diagnostic_patch_title = QLabel("Perpendicular patch")
+        self._diagnostic_patch_title.setWordWrap(True)
+        grid.addWidget(self._diagnostic_patch_title, 0, 0)
         self._diagnostic_detail_title = QLabel("Selected template")
         grid.addWidget(self._diagnostic_detail_title, 0, 1)
         grid.addWidget(self._diagnostic_patch, 1, 0)
@@ -901,7 +963,10 @@ class FilamentTracerWidget(QWidget):
             self._show_error("Part 1 currently supports one 3D tomogram at a time.")
             return
 
+        if self._image_layer is not None:
+            self._image_layer.plane.events.position.disconnect(self._update_pivot_marker)
         self._image_layer = layer
+        layer.plane.events.position.connect(self._update_pivot_marker)
 
         metadata_voxel = layer.metadata.get("filament_tracer_voxel_size_zyx")
         if metadata_voxel is not None:
@@ -920,6 +985,7 @@ class FilamentTracerWidget(QWidget):
             ) / 2.0
             layer.plane.normal = (1.0, 0.0, 0.0)
         self._enable_plane_view()
+        self._update_pivot_marker()
 
         self._particle_display.image_changed()
 
@@ -1070,9 +1136,95 @@ class FilamentTracerWidget(QWidget):
             + normalize(layer.plane.normal) * distance
         )
 
+    def _update_pivot_marker(self, *_args: Any) -> None:
+        layer = self._image_layer
+        if layer is None:
+            return
+        point = np.asarray([layer.data_to_world(layer.plane.position)])
+        marker = self._layer_by_name(PIVOT_LAYER)
+        if isinstance(marker, Points):
+            marker.data = point
+        else:
+            selected = list(self.viewer.layers.selection)
+            active = self.viewer.layers.selection.active
+            marker = self.viewer.add_points(
+                point, name=PIVOT_LAYER, symbol="cross", size=8,
+                face_color="magenta", border_color="white",
+                blending="translucent_no_depth", out_of_slice_display=True,
+                canvas_size_limits=(14, 14),
+            )
+            marker.editable = False
+            self.viewer.layers.selection.clear()
+            self.viewer.layers.selection.update(selected)
+            self.viewer.layers.selection.active = active
+
+    def _use_selected_pivot(self, *_args: Any) -> None:
+        layer = self._image_layer
+        points = self.viewer.layers.selection.active
+        if layer is None:
+            return
+        if (
+            not isinstance(points, Points)
+            or points.name == PIVOT_LAYER
+            or len(points.selected_data) != 1
+        ):
+            self._show_error("Select exactly one tracing or seed point first.")
+            return
+        index = next(iter(points.selected_data))
+        layer.plane.position = layer.world_to_data(
+            points.data_to_world(points.data[index])
+        )
+
+    def _reset_slab_pivot(self, *_args: Any) -> None:
+        layer = self._image_layer
+        if layer is None:
+            return
+        centre = (np.asarray(layer.data.shape, dtype=float) - 1) / 2
+        normal = normalize(np.asarray(layer.plane.normal, dtype=float))
+        anchor = np.asarray(layer.plane.position, dtype=float)
+        # Project the volume centre onto this slice without changing its depth.
+        layer.plane.position = centre - normal * np.dot(centre - anchor, normal)
+
     def _seed_mouse_callback(self, _viewer: Viewer, event: Any) -> Any:
         layer = self._image_layer
         if layer is None or event.type != "mouse_press":
+            return
+
+        if event.button == 3 and self.viewer.dims.ndisplay == 3:
+            start_mouse = np.asarray(event.pos, dtype=float)
+            start_center = np.asarray(self.viewer.camera.center, dtype=float)
+            up = normalize(np.asarray(self.viewer.camera.up_direction))
+            view = normalize(np.asarray(self.viewer.camera.view_direction))
+            right = normalize(np.cross(view, up))
+            zoom = float(self.viewer.camera.zoom)
+            original_pan = self.viewer.camera.mouse_pan
+            self.viewer.camera.mouse_pan = False
+            event.handled = True
+            try:
+                yield
+                while event.type == "mouse_move":
+                    delta = np.asarray(event.pos, dtype=float) - start_mouse
+                    self.viewer.camera.center = tuple(
+                        start_center + (up * delta[1] - right * delta[0]) / zoom
+                    )
+                    event.handled = True
+                    yield
+            finally:
+                self.viewer.camera.mouse_pan = original_pan
+            return
+
+        if (
+            event.button == 2
+            and self._has_control_modifier(event)
+            and self.viewer.dims.ndisplay == 3
+        ):
+            position, direction = layer.click_plane_from_click_data(
+                event.position, event.view_direction, list(self.viewer.dims.displayed)
+            )
+            point = layer.plane.intersect_with_line(position, direction)
+            if point is not None and np.all(np.isfinite(point)):
+                layer.plane.position = point
+            event.handled = True
             return
 
         if event.button == 2 and self.viewer.dims.ndisplay == 3:
@@ -1082,7 +1234,7 @@ class FilamentTracerWidget(QWidget):
                 layer.data_to_world(pivot_data),
                 dtype=float,
             )
-            self.viewer.camera.center = tuple(float(value) for value in pivot_world)
+            camera_offset = np.asarray(self.viewer.camera.center) - pivot_world
             start_normal_world = self._data_direction_to_world(
                 layer,
                 np.asarray(layer.plane.normal, dtype=float),
@@ -1107,15 +1259,23 @@ class FilamentTracerWidget(QWidget):
                     delta_y=float(delta[1]),
                     sensitivity=float(self._rotation_sensitivity.value()),
                 )
-                # Keep this drag anchored to the slab center captured at its
-                # mouse-down. A later right-click captures a fresh center.
+                # The plane anchor is the persistent, visible rotation pivot.
                 layer.plane.position = pivot_data
                 layer.plane.normal = self._world_direction_to_data(
                     layer,
                     normal_world,
                 )
-                self.viewer.camera.center = tuple(float(value) for value in pivot_world)
                 if self._lock_camera_to_slab.isChecked():
+                    offset_length = np.linalg.norm(camera_offset)
+                    if offset_length > 1e-12:
+                        offset, _ = self._rotate_screen_relative(
+                            camera_offset, start_view_world, start_up_world,
+                            float(delta[0]), float(delta[1]),
+                            float(self._rotation_sensitivity.value()),
+                        )
+                        self.viewer.camera.center = tuple(
+                            pivot_world + offset * offset_length
+                        )
                     self.viewer.camera.set_view_direction(
                         view_direction=-normal_world,
                         up_direction=up_world,
@@ -1761,6 +1921,8 @@ class FilamentTracerWidget(QWidget):
     # Tracing and editing
 
     def _start_trace(self) -> None:
+        if self._trace_worker is not None and self._trace_worker.is_running:
+            return
         if self._detector.currentData() == "neural":
             self._trace_status.setText("Neural inference is not implemented yet.")
             return
@@ -1785,12 +1947,15 @@ class FilamentTracerWidget(QWidget):
         self._trace_button.setEnabled(False)
         self._detector.setEnabled(False)
         self._trace_status.setText("Tracing local cross-sections…")
+        self._clear_trace_progress()
+        self._accept_trace_progress = True
         worker = _trace_in_worker(
             image.data,
             filaments,
             self._voxel_size(),
             parameters,
             directions,
+            self._trace_progress_signals.updated,
         )
         worker.returned.connect(self._trace_finished)
         worker.errored.connect(self._trace_failed)
@@ -1803,6 +1968,7 @@ class FilamentTracerWidget(QWidget):
         self,
         result: tuple[list, list[TraceDiagnostic]],
     ) -> None:
+        self._clear_trace_progress()
         if self._project is None:
             return
         filaments, diagnostics = result
@@ -1827,23 +1993,136 @@ class FilamentTracerWidget(QWidget):
         else:
             self._trace_status.setText("Tracing step completed.")
 
+    def _clear_trace_progress(self) -> None:
+        self._accept_trace_progress = False
+        self._remove_layer(LIVE_TRACE_LAYER)
+        self._remove_layer(LIVE_PREDICTION_LAYER)
+
+    def _show_trace_progress(self, update: tuple) -> None:
+        if not getattr(self, "_accept_trace_progress", False):
+            return
+        kind, positions, ids, direction, step = update
+        prediction = kind == "prediction"
+        name = LIVE_PREDICTION_LAYER if prediction else LIVE_TRACE_LAYER
+        data = np.asarray([positions] if prediction else positions).reshape((-1, 3))
+        colors = "#ffd43b" if prediction else [self._filament_color(i) for i in ids]
+        layer = self._layer_by_name(name)
+        if isinstance(layer, Points):
+            layer.data = data
+            layer.face_color = colors
+        else:
+            selected = list(self.viewer.layers.selection)
+            active = self.viewer.layers.selection.active
+            layer = self.viewer.add_points(
+                data, name=name, face_color=colors, border_color="white",
+                symbol="cross" if prediction else "disc", size=6,
+                canvas_size_limits=(14, 14) if prediction else (6, 12),
+                blending="translucent_no_depth", out_of_slice_display=True,
+                **self._overlay_transform(),
+            )
+            layer.editable = False
+            self.viewer.layers.selection.clear()
+            self.viewer.layers.selection.update(selected)
+            self.viewer.layers.selection.active = active
+        layer.visible = True
+        if prediction:
+            self._trace_status.setText(
+                f"Tracing filament {ids} · {direction} step {step} · "
+                "yellow cross = evaluating"
+            )
+        else:
+            marker = self._layer_by_name(LIVE_PREDICTION_LAYER)
+            if marker is not None:
+                marker.visible = False
+            self._trace_status.setText(
+                f"Tracing · {direction} step {step} completed · "
+                f"{len(data)} accepted/seed points"
+            )
+
     def _refresh_diagnostics(self) -> None:
         self._diagnostic_combo.blockSignals(True)
         self._diagnostic_combo.clear()
-        for index, record in enumerate(self._diagnostics):
+        ordered = sorted(
+            enumerate(self._diagnostics),
+            key=lambda item: (
+                item[1].filament_id,
+                0 if item[1].direction == "forward" else 1,
+                item[1].step_number,
+            ),
+        )
+        for index, record in ordered:
             state = "accepted" if record.accepted else "stopped"
             self._diagnostic_combo.addItem(
-                f"F{record.filament_id} {record.direction} "
+                f"Filament {record.filament_id} · {record.direction} "
                 f"step {record.step_number} · "
                 f"{record.confidence:.3f} · {state}",
                 index,
             )
         self._diagnostic_combo.blockSignals(False)
         if self._diagnostics:
-            self._diagnostic_combo.setCurrentIndex(len(self._diagnostics) - 1)
+            self._diagnostic_combo.setCurrentIndex(0)
             self._show_selected_diagnostic()
         else:
+            self._remove_layer(DIAGNOSTIC_PATH_LAYER)
+            self._remove_layer(DIAGNOSTIC_POINT_LAYER)
             self._clear_diagnostic_images("No detector evaluation was produced.")
+
+    def _advance_diagnostic(self, offset: int) -> None:
+        index = self._diagnostic_combo.currentIndex() + offset
+        if 0 <= index < self._diagnostic_combo.count():
+            self._diagnostic_combo.setCurrentIndex(index)
+
+    def _centre_diagnostic(self, *_args: Any) -> None:
+        index = self._diagnostic_combo.currentData()
+        if index is None or self._image_layer is None:
+            return
+        record = self._diagnostics[int(index)]
+        self.viewer.camera.center = self._image_layer.data_to_world(
+            record.predicted_position_zyx
+        )
+
+    def _highlight_diagnostic(self, record: TraceDiagnostic) -> None:
+        """Identify the actual filament without moving the camera or slab."""
+        if self._image_layer is None:
+            return
+        selected = list(self.viewer.layers.selection)
+        active = self.viewer.layers.selection.active
+        self._remove_layer(DIAGNOSTIC_PATH_LAYER)
+        self._remove_layer(DIAGNOSTIC_POINT_LAYER)
+        color = self._filament_color(record.filament_id)
+        if self._project is not None:
+            filament = next(
+                (f for f in self._project.filaments
+                 if f.filament_id == record.filament_id), None
+            )
+            if filament is not None and len(filament.points) >= 2:
+                path = self.viewer.add_shapes(
+                    [np.asarray([p.position_zyx for p in filament.points])],
+                    shape_type="path", name=DIAGNOSTIC_PATH_LAYER,
+                    edge_color=color, edge_width=4, face_color="transparent",
+                    blending="translucent_no_depth", **self._overlay_transform(),
+                )
+                path.editable = False
+        point = self.viewer.add_points(
+            [record.predicted_position_zyx], name=DIAGNOSTIC_POINT_LAYER,
+            face_color=color, border_color="white", size=8,
+            symbol="ring", canvas_size_limits=(16, 16),
+            blending="translucent_no_depth", out_of_slice_display=True,
+            features={"label": [
+                f"Filament {record.filament_id} · {record.direction} "
+                f"step {record.step_number} (predicted)"
+            ]},
+            text={"string": "{label}", "color": "white", "size": 12,
+                  "translation": [0, 12, 12]},
+            **self._overlay_transform(),
+        )
+        point.editable = False
+        self.viewer.layers.selection.clear()
+        self.viewer.layers.selection.update(
+            layer for layer in selected if layer in self.viewer.layers
+        )
+        if active in self.viewer.layers:
+            self.viewer.layers.selection.active = active
 
     def _show_selected_diagnostic(self) -> None:
         index = self._diagnostic_combo.currentData()
@@ -1855,11 +2134,20 @@ class FilamentTracerWidget(QWidget):
             )
             return
         record = self._diagnostics[int(index)]
+        self._highlight_diagnostic(record)
         detector = record.detector
         if detector is None:
             self._clear_diagnostic_images(record.reason)
             self._diagnostic_summary.setText(self._diagnostic_text(record))
             return
+
+        if detector.slab_slices_used > 1:
+            self._diagnostic_patch_title.setText(
+                f"Perpendicular slab · average of {detector.slab_slices_used} slices"
+                f"\nSpacing: {detector.slab_spacing_angstrom:g} Å"
+            )
+        else:
+            self._diagnostic_patch_title.setText("Perpendicular patch · single slice")
 
         patch_pixmap = self._diagnostic_pixmap(
             detector.patch,
@@ -1891,6 +2179,7 @@ class FilamentTracerWidget(QWidget):
         self._diagnostic_summary.setText(self._diagnostic_text(record))
 
     def _clear_diagnostic_images(self, message: str) -> None:
+        self._diagnostic_patch_title.setText("Perpendicular patch · no data")
         for label in (
             self._diagnostic_patch,
             self._diagnostic_template,
@@ -1910,6 +2199,7 @@ class FilamentTracerWidget(QWidget):
             detector = record.detector
             robust = (
                 f"\nRobust sampling: {detector.slab_slices_used} slice(s)"
+                f" · spacing: {detector.slab_spacing_angstrom:g} Å"
                 f" · {detector.orientation_candidates} orientation(s)"
                 f" · selected offset "
                 f"{detector.selected_orientation_offset_degrees:.1f}°"
@@ -2004,6 +2294,7 @@ class FilamentTracerWidget(QWidget):
         return pixmap
 
     def _trace_failed(self, error: Exception) -> None:
+        self._clear_trace_progress()
         self._trace_status.setText(f"Tracing failed: {error}")
         self._show_error(f"Tracing failed:\n{error}")
 
@@ -2317,6 +2608,9 @@ class FilamentTracerWidget(QWidget):
         QMessageBox.critical(self, "Filament Tracer", message)
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802
+        self._clear_trace_progress()
+        if self._image_layer is not None:
+            self._image_layer.plane.events.position.disconnect(self._update_pivot_marker)
         try:
             self.viewer.mouse_drag_callbacks.remove(self._seed_mouse_callback)
         except ValueError:

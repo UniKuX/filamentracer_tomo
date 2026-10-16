@@ -55,6 +55,9 @@ The plugin has five tabs:
   See [particle display](docs/particle_display.md).
 
 RELION export is a standalone CLI; see [RELION export](docs/relion_export.md).
+For Warp/Miss-Alignment reconstructions, use the standalone
+[WarpTools coordinate export](docs/warp_export.md) to extract in Warp and refine
+the resulting particle series in RELION 5.
 
 Skeleton load/save and vertex synchronization controls appear beneath the
 manual and assisted tracing tabs and operate on the same skeleton project.
@@ -67,9 +70,14 @@ manual and assisted tracing tabs and operate on the same skeleton project.
    Average/Maximum/Minimum projection if needed, then click
    **Capture plane A**. **Keep slab face-on** makes the camera follow the
    rotating slab; **Face slab toward camera** resets the slab to the current
-   view direction. Every new right-drag uses the slab's current center as a
-   fresh rotation pivot, so moving the slab before the next drag also moves
-   the pivot.
+   view direction. The magenta crosshair marks the rotation pivot. Ctrl+right-click
+   places it on the slab's central plane; to use an exact 3D seed or tracing
+   vertex, select that point and click **Use selected point as pivot** (this
+   moves the slab to pass through that point). **Reset pivot to slice centre**
+   restores the central pivot without changing the slice depth or angle.
+   Hold the mouse wheel (middle button) and drag to pan without changing
+   the slab angle or depth. Right-drag preserves that pan instead of snapping
+   back to the centre. Moving the slab along its normal also moves the pivot.
    Shift+left-drag translates continuously along the slab normal; dragging
    upward moves forward and dragging downward moves backward. A stationary
    Shift+left-click, including small mouse jitter, is suppressed because
@@ -95,13 +103,23 @@ manual and assisted tracing tabs and operate on the same skeleton project.
    voxel size. Orientation search is ranked primarily by template score;
    a circularity weight around `0.05–0.10` can help when oblique sections look
    oval. These options cost more per tracing step and are off by default.
+   While tracing runs, a yellow cross on the tomogram marks the prediction
+   currently being evaluated. Coloured dots show seed and accepted points as
+   the trace grows, after bundle collision checks. Updates leave the camera
+   and slab unchanged; the completed skeleton replaces these temporary marks.
 8. Use **Tracing diagnostics** to inspect each attempted step. The yellow cross
    is the predicted center and the cyan/red circle is the accepted/rejected
    correlation peak. Compare the perpendicular patch, selected template, and
    score map before changing detector parameters. The template source reports
    `seed crop` for the first step and `adaptive step N` thereafter. Diagnostics
-   also report the slab slice count, number of tested orientations, selected
-   angular offset, circularity, and combined selection score.
+   are ordered by filament, then direction and step; **Previous step** and
+   **Next step** follow this order. Selecting an entry highlights that filament
+   and labels its predicted step in the viewer. **Centre on step** pans to it
+   without changing the slab. The patch heading distinguishes a single slice
+   from an averaged slab and gives the slice count and spacing recorded during
+   detection, independently of the current viewing-slab settings. Diagnostics
+   also report the number of tested orientations, selected angular offset,
+   circularity, and combined selection score.
 9. Correct vertices in the `FT skeleton vertices` layer, click
    **Sync vertex edits**, and save the result as `.ftskeleton.json`.
 

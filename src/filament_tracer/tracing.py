@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -155,6 +156,8 @@ def extend_skeletons(
         NDArray[np.float32] | OrientedTemplate,
     ]
     | None = None,
+    on_prediction: Callable[[int, int, tuple[float, float, float]], None] | None = None,
+    on_step: Callable[[list[FilamentSkeleton], int], None] | None = None,
 ) -> list[FilamentSkeleton]:
     """Extend a bundle while adapting each template after accepted steps."""
 
@@ -209,6 +212,11 @@ def extend_skeletons(
             individual = data_vector_to_physical(current - previous, voxel_size)
             blended_physical = normalize(0.75 * individual + 0.25 * bundle_tangent)
             predicted = current + blended_physical * physical_step / voxel_size
+
+            if on_prediction is not None:
+                on_prediction(
+                    filament.filament_id, step_number, _position_tuple(predicted)
+                )
 
             if not _inside_volume(predicted, np.asanyarray(volume).shape):
                 _record_diagnostic(
@@ -334,6 +342,11 @@ def extend_skeletons(
                 continue
             adaptive_templates[filament_id] = template
             template_sources[filament_id] = f"adaptive step {step_number}"
+
+        # Publish only after collision rollback, so tentative points never
+        # appear as accepted in a live preview.
+        if on_step is not None:
+            on_step(filaments, step_number)
 
     return filaments
 

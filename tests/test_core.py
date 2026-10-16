@@ -413,6 +413,8 @@ def test_tracer_extends_a_seeded_filament() -> None:
         "forward",
     )
     diagnostics: list[TraceDiagnostic] = []
+    predictions = []
+    completed_sizes = []
 
     extend_skeletons(
         volume,
@@ -422,9 +424,15 @@ def test_tracer_extends_a_seeded_filament() -> None:
         direction="forward",
         diagnostics=diagnostics,
         seed_templates=templates,
+        on_prediction=lambda fid, step, pos: predictions.append((fid, step, pos)),
+        on_step=lambda current, step: completed_sizes.append(
+            (step, len(current[0].points))
+        ),
     )
 
     assert len(filaments[0].points) == 5
+    assert [item[:2] for item in predictions] == [(1, 1), (1, 2), (1, 3)]
+    assert completed_sizes == [(1, 3), (2, 4), (3, 5)]
     assert filaments[0].forward_stop_reason is None
     assert filaments[0].points[-1].position_zyx[0] > 13.0
     assert len(diagnostics) == 3

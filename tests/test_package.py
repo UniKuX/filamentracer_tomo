@@ -18,6 +18,65 @@ def test_version() -> None:
     assert __version__ == "0.1.0"
 
 
+def test_live_trace_updates_before_worker_finishes(
+    make_napari_viewer, monkeypatch, qtbot,
+) -> None:
+    from threading import Event
+
+    from filament_tracer import _widget
+    from filament_tracer.models import TracingParameters
+    from filament_tracer.tracing import initialize_skeletons
+
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((20, 32, 32)), scale=(2, 3, 4))
+    widget = _widget.FilamentTracerWidget(viewer)
+    widget._set_image_layer(image)
+    filaments = initialize_skeletons(
+        np.array([[5, 12, 12]]), np.array([[8, 12, 12]]), [(0, 0)], 10,
+    )
+    release_prediction = Event()
+    release_result = Event()
+    monkeypatch.setattr(_widget, "build_seed_templates", lambda *args: {})
+
+    def extend(*args, on_prediction, on_step, **kwargs):
+        on_prediction(1, 1, (10, 12, 12))
+        assert release_prediction.wait(10)
+        on_step(filaments, 1)
+        assert release_result.wait(10)
+
+    monkeypatch.setattr(_widget, "extend_skeletons", extend)
+    widget._accept_trace_progress = True
+    worker = _widget._trace_in_worker(
+        image.data, filaments, (2, 3, 4), TracingParameters(), ("forward",),
+        widget._trace_progress_signals.updated,
+    )
+    worker.returned.connect(widget._trace_finished)
+    errors = []
+    worker.errored.connect(errors.append)
+    centre = viewer.camera.center
+    plane = np.asarray(image.plane.position).copy()
+    worker.start()
+    try:
+        qtbot.waitUntil(lambda: _widget.LIVE_PREDICTION_LAYER in viewer.layers)
+        marker = viewer.layers[_widget.LIVE_PREDICTION_LAYER]
+        np.testing.assert_allclose(marker.data_to_world(marker.data[0]), (20, 36, 48))
+        assert worker.is_running
+        release_prediction.set()
+        qtbot.waitUntil(lambda: _widget.LIVE_TRACE_LAYER in viewer.layers)
+        assert len(viewer.layers[_widget.LIVE_TRACE_LAYER].data) == 2
+        assert not marker.visible
+        assert viewer.layers.selection.active is image
+        np.testing.assert_allclose(viewer.camera.center, centre)
+        np.testing.assert_allclose(image.plane.position, plane)
+    finally:
+        release_prediction.set()
+        release_result.set()
+        qtbot.waitUntil(lambda: not worker.is_running)
+    qtbot.waitUntil(lambda: _widget.LIVE_TRACE_LAYER not in viewer.layers)
+    assert _widget.LIVE_PREDICTION_LAYER not in viewer.layers
+    assert not errors
+
+
 def test_workflow_widget(make_napari_viewer) -> None:
     from filament_tracer._widget import FilamentTracerWidget
 
@@ -134,6 +193,80 @@ def test_widget_initializes_skeleton_from_seed_layers(make_napari_viewer) -> Non
     assert widget._project.filaments[0].points[0].position_zyx[1] == 13.5
 
 
+def test_diagnostics_group_steps_and_identify_filament(make_napari_viewer) -> None:
+    from filament_tracer._widget import (
+        DIAGNOSTIC_PATH_LAYER,
+        DIAGNOSTIC_POINT_LAYER,
+        FilamentTracerWidget,
+    )
+    from filament_tracer.tracing import initialize_skeletons
+
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((20, 32, 32)), scale=(2, 3, 4))
+    widget = FilamentTracerWidget(viewer)
+    widget._set_image_layer(image)
+    filaments = initialize_skeletons(
+        np.array([[5, 12, 12], [5, 20, 20]]),
+        np.array([[8, 12, 12], [8, 20, 20]]), [(0, 0), (1, 1)], 10,
+    )
+    widget._project = SimpleNamespace(filaments=filaments)
+    detector = DetectionDiagnostic(
+        patch=np.ones((9, 9), dtype=np.float32),
+        template=np.ones((3, 3), dtype=np.float32),
+        response=np.ones((9, 9), dtype=np.float32),
+        search_mask=np.ones((9, 9), dtype=bool),
+        sample_spacing_angstrom=2, predicted_rc=(4, 4), detected_rc=(4, 4),
+        template_source="seed crop", slab_slices_used=5, slab_spacing_angstrom=3,
+    )
+    record = TraceDiagnostic(
+        filament_id=1, direction="forward", step_number=1,
+        predicted_position_zyx=(9, 12, 12), detected_position_zyx=(9, 12, 12),
+        confidence=0.8, radius_angstrom=10, valid_fraction=1,
+        accepted=True, reason="accepted", detector=detector,
+    )
+    widget._diagnostics = [
+        record, replace(record, filament_id=2),
+        replace(record, step_number=2),
+        replace(record, filament_id=2, step_number=2),
+        replace(record, direction="backward"),
+    ]
+    centre = viewer.camera.center
+    plane = np.asarray(image.plane.position).copy()
+    widget._refresh_diagnostics()
+    assert [widget._diagnostic_combo.itemData(i) for i in range(5)] == [0, 2, 4, 1, 3]
+    assert "average of 5 slices" in widget._diagnostic_patch_title.text()
+    assert "Spacing: 3 Å" in widget._diagnostic_patch_title.text()
+    # Changing live settings must not relabel saved detector results.
+    widget._use_slab_averaging.setChecked(False)
+    widget._show_selected_diagnostic()
+    assert "average of 5 slices" in widget._diagnostic_patch_title.text()
+    np.testing.assert_allclose(
+        viewer.layers[DIAGNOSTIC_PATH_LAYER].data[0],
+        [p.position_zyx for p in filaments[0].points],
+    )
+    marker = viewer.layers[DIAGNOSTIC_POINT_LAYER]
+    assert "Filament 1" in marker.features["label"][0]
+    np.testing.assert_allclose(
+        marker.data_to_world(marker.data[0]), image.data_to_world((9, 12, 12))
+    )
+    assert viewer.layers.selection.active is image
+    np.testing.assert_allclose(viewer.camera.center, centre)
+    widget._centre_diagnostic()
+    np.testing.assert_allclose(viewer.camera.center, image.data_to_world((9, 12, 12)))
+    np.testing.assert_allclose(image.plane.position, plane)
+    widget._advance_diagnostic(1)
+    assert widget._diagnostic_combo.currentData() == 2
+    widget._diagnostic_combo.setCurrentIndex(3)
+    assert "Filament 2" in viewer.layers[DIAGNOSTIC_POINT_LAYER].features["label"][0]
+    widget._diagnostics[1].detector = replace(detector, slab_slices_used=1)
+    widget._show_selected_diagnostic()
+    assert "single slice" in widget._diagnostic_patch_title.text()
+    widget._diagnostics = []
+    widget._refresh_diagnostics()
+    assert DIAGNOSTIC_PATH_LAYER not in viewer.layers
+    assert DIAGNOSTIC_POINT_LAYER not in viewer.layers
+
+
 def test_widget_memory_maps_mrc(
     make_napari_viewer,
     tmp_path: Path,
@@ -213,6 +346,7 @@ def test_right_drag_rotates_oblique_slab(make_napari_viewer) -> None:
     )
     start_position = np.asarray(image.plane.position, dtype=float).copy()
     start_normal = np.asarray(image.plane.normal, dtype=float).copy()
+    start_center = np.asarray(viewer.camera.center).copy()
     event = SimpleNamespace(
         type="mouse_press",
         button=2,
@@ -225,7 +359,7 @@ def test_right_drag_rotates_oblique_slab(make_napari_viewer) -> None:
     assert event.handled
     np.testing.assert_allclose(
         viewer.camera.center,
-        image.data_to_world(start_position),
+        start_center,
     )
 
     event.type = "mouse_move"
@@ -252,6 +386,7 @@ def test_right_drag_rotates_oblique_slab(make_napari_viewer) -> None:
 
     next_position = np.array((9.0, 12.0, 10.0))
     image.plane.position = next_position
+    next_center = np.asarray(viewer.camera.center).copy()
     next_event = SimpleNamespace(
         type="mouse_press",
         button=2,
@@ -262,7 +397,7 @@ def test_right_drag_rotates_oblique_slab(make_napari_viewer) -> None:
     next(next_drag)
     np.testing.assert_allclose(
         viewer.camera.center,
-        image.data_to_world(next_position),
+        next_center,
     )
     next_event.type = "mouse_move"
     next_event.pos = (95.0, 90.0)
@@ -271,6 +406,72 @@ def test_right_drag_rotates_oblique_slab(make_napari_viewer) -> None:
     next_event.type = "mouse_release"
     with pytest.raises(StopIteration):
         next(next_drag)
+
+
+def test_middle_drag_pans_without_changing_slab(make_napari_viewer) -> None:
+    from filament_tracer._widget import FilamentTracerWidget
+
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((20, 32, 32)), scale=(2, 3, 4))
+    widget = FilamentTracerWidget(viewer)
+    widget._set_image_layer(image)
+    viewer.camera.set_view_direction(
+        view_direction=(-1, 0, 0), up_direction=(0, -1, 0)
+    )
+    viewer.camera.zoom = 2
+    centre = np.asarray(viewer.camera.center).copy()
+    angles = viewer.camera.angles
+    position = np.asarray(image.plane.position).copy()
+    normal = np.asarray(image.plane.normal).copy()
+    event = SimpleNamespace(
+        type="mouse_press", button=3, pos=(100, 100), handled=False
+    )
+    drag = widget._seed_mouse_callback(viewer, event)
+    next(drag)
+    event.type = "mouse_move"
+    event.pos = (120, 110)
+    next(drag)
+    np.testing.assert_allclose(viewer.camera.center, centre + (0, -5, -10))
+    np.testing.assert_allclose(viewer.camera.angles, angles)
+    np.testing.assert_allclose(image.plane.position, position)
+    np.testing.assert_allclose(image.plane.normal, normal)
+    assert event.handled
+    drag.close()
+    assert viewer.camera.mouse_pan
+    # Starting another rotation must not undo the pan.
+    centre = np.asarray(viewer.camera.center).copy()
+    event.type = "mouse_press"
+    event.button = 2
+    drag = widget._seed_mouse_callback(viewer, event)
+    next(drag)
+    np.testing.assert_allclose(viewer.camera.center, centre)
+    drag.close()
+
+
+def test_selected_pivot_and_reset(make_napari_viewer) -> None:
+    from filament_tracer._widget import PIVOT_LAYER, FilamentTracerWidget
+
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((20, 32, 32)), scale=(2, 3, 4))
+    widget = FilamentTracerWidget(viewer)
+    widget._set_image_layer(image)
+    points = viewer.add_points([[6, 12, 20]], scale=(2, 3, 4))
+    points.selected_data = {0}
+    widget._use_selected_pivot()
+    np.testing.assert_allclose(image.plane.position, (6, 12, 20))
+    np.testing.assert_allclose(viewer.layers[PIVOT_LAYER].data, [[12, 36, 80]])
+    widget._reset_slab_pivot()
+    np.testing.assert_allclose(image.plane.position, (6, 15.5, 15.5))
+
+    event = SimpleNamespace(
+        type="mouse_press", button=2, modifiers=("Control",),
+        position=image.data_to_world((6, 10, 11)),
+        view_direction=(1, 0, 0), handled=False,
+    )
+    mouse_press_callbacks(viewer, event)
+    np.testing.assert_allclose(image.plane.position, (6, 10, 11))
+    np.testing.assert_allclose(image.plane.normal, (1, 0, 0))
+    assert event.handled
 
 
 def test_slab_controls_apply_projection_and_thickness(
