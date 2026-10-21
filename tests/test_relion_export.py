@@ -8,8 +8,59 @@ from filament_tracer.models import (
     TracingParameters,
     VolumeMetadata,
 )
-from filament_tracer.relion_export import coordinate_table, main, resample_path
+from filament_tracer.relion_export import (
+    coordinate_table,
+    helical_priors,
+    main,
+    resample_path,
+)
 from filament_tracer.tracing import initialize_skeletons
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 1, 0],
+        [0, -1, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+        [1, 2, 3],
+    ],
+)
+def test_helical_prior_axis_matches_physical_tangent(direction):
+    from filament_tracer.relion_particles import subtomogram_matrices
+
+    points = np.array([[10, 10, 10], np.array([10, 10, 10]) + direction])
+    voxel = [4, 2, 1]
+    _, arc = resample_path(points, voxel, 1)
+    tilt, psi = helical_priors(points, voxel, arc, 3)
+    matrices = subtomogram_matrices(np.column_stack([np.full(len(arc), 37), tilt, psi]))
+    expected = (np.array(direction) * voxel)[::-1]
+    expected = expected / np.linalg.norm(expected)
+    np.testing.assert_allclose(
+        matrices[:, :, 2], np.tile(expected, (len(arc), 1)), atol=1e-12
+    )
+
+
+def test_prior_bend_duplicates_single_sample_and_validation():
+    points = [[0, 0, 0], [0, 0, 0], [0, 0, 10], [0, 10, 10]]
+    tilt, psi = helical_priors(points, [1] * 3, np.array([0, 10, 20]), 4)
+    np.testing.assert_allclose(tilt, [90, 90, 90])
+    np.testing.assert_allclose(psi, [180, 135, 90])
+    short = coordinate_table(make_project(), 1000, 1, "TS")
+    assert len(short) == 2
+    assert "rlnAngleRot" not in short
+    assert "rlnAngleRotPrior" not in short
+    np.testing.assert_allclose(short.rlnAngleTiltPrior, 0)
+    for kwargs in ({"tangent_window": float("nan")}, {"tangent_window": 0}):
+        with pytest.raises(ValueError):
+            coordinate_table(make_project(), 10, 1, "TS", **kwargs)
+    with pytest.raises(ValueError, match="Undefined"):
+        helical_priors([[0, 0, 0], [0, 0, 10], [0, 0, 0]], [1] * 3, np.array([10]), 4)
+
+
 
 
 def make_project():
@@ -76,11 +127,18 @@ def test_export_cli_roundtrip_and_no_overwrite(tmp_path):
         "0.5",
         "--tomo-name",
         "TS_01",
+        "--tangent-window",
+        "15",
     ]
     main(args)
     table = starfile.read(output)
     assert len(table) == 6
     assert table.rlnTomoName.tolist() == ["TS_01"] * 6
+    assert "rlnAngleRot" not in table
+    assert "rlnAngleRotPrior" not in table
+    for angle, value in (("Tilt", 0), ("Psi", 0)):
+        np.testing.assert_allclose(table[f"rlnAngle{angle}Prior"], value)
+        np.testing.assert_allclose(table[f"rlnAngle{angle}"], value)
     original = output.read_bytes()
     with pytest.raises(SystemExit) as error:
         main(args)
