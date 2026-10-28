@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+source "${HOME}/miniforge3/etc/profile.d/conda.sh"
 conda activate filament-tracer
 cd "${project_root}"
 

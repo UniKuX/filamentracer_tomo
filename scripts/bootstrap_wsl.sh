@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-conda_root="${HOME}/miniconda3"
+conda_root="${HOME}/miniforge3"
 environment_name="filament-tracer"
 
 if [[ ! -f "${conda_root}/etc/profile.d/conda.sh" ]]; then

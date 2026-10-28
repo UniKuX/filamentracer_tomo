@@ -10,12 +10,14 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mrcfile>=1.5,<2",
+    "morphosamplers==0.0.16",
     "napari[pyqt6]>=0.6.4,<0.7",
-    "numpy>=1.26,<3",
+    "numpy==2.2.6",
+    "pandas>=2.2,<4",
     "pydantic>=2.8,<3",
     "scikit-image>=0.24,<1",
-    "scipy>=1.13,<2",
-    "starfile>=0.5,<1",
+    "scipy==1.15.3",
+    "starfile==0.5.13",
 ]
 
 [project.optional-dependencies]
@@ -42,4 +44,5 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
 
